@@ -134,6 +134,11 @@ app.whenReady().then(() => {
 
     // Auto-update (production only)
     if (!isDev) {
+        autoUpdater.setFeedURL({
+            provider: 'github',
+            owner: 'pretend1111',
+            repo: 'claude-desktop-app',
+        });
         autoUpdater.autoDownload = true;
         autoUpdater.autoInstallOnAppQuit = true;
         autoUpdater.logger = console;

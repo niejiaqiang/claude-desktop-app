@@ -74,11 +74,7 @@
         "to": "engine/.env"
       }
     ],
-    "publish": {
-      "provider": "github",
-      "owner": "pretend1111",
-      "repo": "claude-desktop-app"
-    },
+    "publish": null,
     "win": {
       "target": [
         "nsis"

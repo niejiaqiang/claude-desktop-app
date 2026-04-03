@@ -25,7 +25,7 @@ frontend-error.log
 
 # Engine dependencies (install separately with: cd engine && bun install)
 engine/node_modules/
-engine/.env
+# engine/.env is committed (no secrets, only public config)
 engine/bun.lockb
 
 # Editor
