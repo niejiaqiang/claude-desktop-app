@@ -8,6 +8,29 @@ import DocxPreview from './DocxPreview';
 import PdfPreview from './PdfPreview';
 import { DocumentInfo } from './DocumentCard';
 import { copyToClipboard } from '../utils/clipboard';
+import { buildArtifactHtml } from '../utils/artifactRenderer';
+
+/** Renders HTML/React artifact content in a sandboxed iframe */
+const ArtifactPreview: React.FC<{ content: string; type: string }> = ({ content, type }) => {
+  const [blobUrl, setBlobUrl] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const html = buildArtifactHtml(content, type);
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    setBlobUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [content, type]);
+
+  if (!blobUrl) return null;
+  return (
+    <iframe
+      src={blobUrl}
+      className="w-full h-full border-0 bg-white"
+      title="Artifact Preview"
+    />
+  );
+};
 
 interface DocumentPanelProps {
   document: DocumentInfo;
@@ -16,10 +39,17 @@ interface DocumentPanelProps {
 
 const DocumentPanel: React.FC<DocumentPanelProps> = ({ document: doc, onClose }) => {
   const fmt = (doc.format || 'markdown').toLowerCase();
-  
+  // Detect actual format from file extension if fmt is generic (e.g. "text")
+  const extMatch = (doc.title || '').match(/\.(\w+)$/);
+  const ext = extMatch ? extMatch[1].toLowerCase() : '';
+
   const isBinary = ['pptx', 'docx', 'xlsx', 'pdf'].includes(fmt);
-  const isMarkdown = ['markdown', 'md'].includes(fmt);
-  const isCode = !isBinary && !isMarkdown;
+  const isMarkdown = ['markdown', 'md'].includes(fmt) || ext === 'md';
+  const contentStart = (doc.content || '').trimStart().slice(0, 50).toLowerCase();
+  const isHtml = ['html', 'htm'].includes(fmt) || ['html', 'htm'].includes(ext) || contentStart.startsWith('<!doctype html') || contentStart.startsWith('<html');
+  const isReact = ['jsx', 'tsx'].includes(fmt) || ['jsx', 'tsx'].includes(ext);
+  const isRenderable = isHtml || isReact;
+  const isCode = !isBinary && !isMarkdown && !isRenderable;
 
   const [viewMode, setViewMode] = useState<'preview' | 'code'>(isCode ? 'code' : 'preview');
   const [showCopyMenu, setShowCopyMenu] = useState(false);
@@ -142,7 +172,7 @@ const DocumentPanel: React.FC<DocumentPanelProps> = ({ document: doc, onClose })
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-claude-border flex-shrink-0">
         <div className="flex items-center min-w-0 gap-3 flex-1">
-          {isMarkdown && (
+          {(isMarkdown || isRenderable) && (
             <div className="flex bg-claude-btnHover rounded-lg p-0.5 flex-shrink-0">
                 <button
                     onClick={() => setViewMode('preview')}
@@ -232,8 +262,11 @@ const DocumentPanel: React.FC<DocumentPanelProps> = ({ document: doc, onClose })
       </div>
 
       {/* Content */}
-      <div className={`flex-1 overflow-y-auto chat-font-scope ${fmt === 'docx' || fmt === 'pdf' ? 'px-6 py-6 bg-claude-hover' : 'px-8 py-6'} ${viewMode === 'code' || isCode ? '!p-0 overflow-hidden bg-[#FAFAFA] dark:bg-[#1E1E1E]' : ''}`}>
-        {viewMode === 'code' || isCode ? (
+      <div className={`flex-1 overflow-y-auto chat-font-scope ${fmt === 'docx' || fmt === 'pdf' ? 'px-6 py-6 bg-claude-hover' : 'px-8 py-6'} ${viewMode === 'code' || isCode ? '!p-0 overflow-hidden bg-[#FAFAFA] dark:bg-[#1E1E1E]' : ''} ${viewMode === 'preview' && isRenderable ? '!p-0 !overflow-hidden' : ''}`}>
+        {/* Live HTML/React preview */}
+        {viewMode === 'preview' && isRenderable && doc.content ? (
+          <ArtifactPreview content={doc.content} type={isReact ? 'application/vnd.ant.react' : 'text/html'} />
+        ) : viewMode === 'code' || isCode ? (
              <div className="flex h-full font-mono text-[13px] leading-relaxed relative bg-[#FAFAFA] dark:bg-[#1E1E1E] overflow-hidden">
                  {/* Unified scrollable area with line numbers + code side by side */}
                 <div ref={contentRef} onScroll={handleScroll} className="flex-1 overflow-auto bg-[#FAFAFA] dark:bg-[#1E1E1E]">

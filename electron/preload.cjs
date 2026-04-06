@@ -20,4 +20,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // File explorer: open folder containing a file, or open a folder directly
     showItemInFolder: (filePath) => ipcRenderer.invoke('show-item-in-folder', filePath),
     openFolder: (folderPath) => ipcRenderer.invoke('open-folder', folderPath),
+
+    // Window resize
+    resizeWindow: (width, height) => ipcRenderer.invoke('resize-window', width, height),
+
+    // Open external URL in system browser (for OAuth flows etc.)
+    openExternal: (url) => ipcRenderer.invoke('open-external', url),
+
+    // Auto-update events
+    onUpdateStatus: (callback) => ipcRenderer.on('update-status', (_, status) => callback(status)),
+    installUpdate: () => ipcRenderer.invoke('install-update'),
 });

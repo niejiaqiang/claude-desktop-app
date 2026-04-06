@@ -3,10 +3,10 @@ import { useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, Plus, Search, Trash2, Sparkles, LayoutGrid, FileText,
   ChevronRight, ChevronDown, Folder, File, MoreHorizontal, Info, Eye, Code,
-  Settings, Check, MessageSquare, ClipboardList, Upload
+  Settings, Check, MessageSquare, ClipboardList, Upload, Github
 } from 'lucide-react';
 import MarkdownRenderer from './MarkdownRenderer';
-import { getSkills, getSkillDetail, createSkill, updateSkill, deleteSkill, toggleSkill } from '../api';
+import { getSkills, getSkillDetail, createSkill, updateSkill, deleteSkill, toggleSkill, getGithubStatus, getGithubAuthUrl, disconnectGithub } from '../api';
 import searchIconImg from '../assets/icons/search-icon.png';
 import skillsImg from '../assets/icons/skills.png';
 import connectorsImg from '../assets/icons/connectors.png';
@@ -29,32 +29,42 @@ interface Skill {
 // File structure for skill-creator matching the official anthropics/skills repo
 const SKILL_CREATOR_FILES = [
   { name: 'SKILL.md', type: 'file' },
-  { name: 'agents', type: 'folder', children: [
-    { name: 'analyzer.md', type: 'file' },
-    { name: 'comparator.md', type: 'file' },
-    { name: 'grader.md', type: 'file' },
-  ]},
-  { name: 'assets', type: 'folder', children: [
-    { name: 'eval_review.html', type: 'file' },
-  ]},
-  { name: 'eval-viewer', type: 'folder', children: [
-    { name: 'generate_review.py', type: 'file' },
-    { name: 'viewer.html', type: 'file' },
-  ]},
-  { name: 'references', type: 'folder', children: [
-    { name: 'schemas.md', type: 'file' },
-  ]},
-  { name: 'scripts', type: 'folder', children: [
-    { name: '__init__.py', type: 'file' },
-    { name: 'aggregate_benchmark.py', type: 'file' },
-    { name: 'generate_report.py', type: 'file' },
-    { name: 'improve_description.py', type: 'file' },
-    { name: 'package_skill.py', type: 'file' },
-    { name: 'quick_validate.py', type: 'file' },
-    { name: 'run_eval.py', type: 'file' },
-    { name: 'run_loop.py', type: 'file' },
-    { name: 'utils.py', type: 'file' },
-  ]},
+  {
+    name: 'agents', type: 'folder', children: [
+      { name: 'analyzer.md', type: 'file' },
+      { name: 'comparator.md', type: 'file' },
+      { name: 'grader.md', type: 'file' },
+    ]
+  },
+  {
+    name: 'assets', type: 'folder', children: [
+      { name: 'eval_review.html', type: 'file' },
+    ]
+  },
+  {
+    name: 'eval-viewer', type: 'folder', children: [
+      { name: 'generate_review.py', type: 'file' },
+      { name: 'viewer.html', type: 'file' },
+    ]
+  },
+  {
+    name: 'references', type: 'folder', children: [
+      { name: 'schemas.md', type: 'file' },
+    ]
+  },
+  {
+    name: 'scripts', type: 'folder', children: [
+      { name: '__init__.py', type: 'file' },
+      { name: 'aggregate_benchmark.py', type: 'file' },
+      { name: 'generate_report.py', type: 'file' },
+      { name: 'improve_description.py', type: 'file' },
+      { name: 'package_skill.py', type: 'file' },
+      { name: 'quick_validate.py', type: 'file' },
+      { name: 'run_eval.py', type: 'file' },
+      { name: 'run_loop.py', type: 'file' },
+      { name: 'utils.py', type: 'file' },
+    ]
+  },
   { name: 'LICENSE.txt', type: 'file' },
 ];
 
@@ -67,6 +77,46 @@ const CustomizePage = () => {
   const [detail, setDetail] = useState<Skill | null>(null);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
+
+  // GitHub connector state
+  const [githubConnected, setGithubConnected] = useState(false);
+  const [githubUser, setGithubUser] = useState<{ login: string; avatar_url: string; name?: string } | null>(null);
+  const [selectedConnector, setSelectedConnector] = useState<'github' | 'gdrive'>('github');
+
+  useEffect(() => {
+    getGithubStatus().then(data => {
+      setGithubConnected(data.connected);
+      if (data.user) setGithubUser(data.user);
+    }).catch(() => {});
+    // Poll for connection after OAuth redirect (user might have just authorized in browser)
+    const poll = setInterval(() => {
+      getGithubStatus().then(data => {
+        if (data.connected && !githubConnected) {
+          setGithubConnected(true);
+          if (data.user) setGithubUser(data.user);
+        }
+      }).catch(() => {});
+    }, 3000);
+    return () => clearInterval(poll);
+  }, [githubConnected]);
+
+  const handleGithubConnect = async () => {
+    try {
+      const { url } = await getGithubAuthUrl();
+      // Open in system browser (Electron) or new window (web)
+      if ((window as any).electronAPI?.openExternal) {
+        (window as any).electronAPI.openExternal(url);
+      } else {
+        window.open(url, '_blank');
+      }
+    } catch (e) { console.error('GitHub auth error:', e); }
+  };
+
+  const handleGithubDisconnect = async () => {
+    await disconnectGithub();
+    setGithubConnected(false);
+    setGithubUser(null);
+  };
 
   // Tree state
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set(['examples', 'myskills']));
@@ -346,8 +396,8 @@ const CustomizePage = () => {
         </nav>
       </div>
 
-      {/* 2. Middle Column: Skills List */}
-      {tab === 'skills' && (
+      {/* 2. Middle Column: Skills List or Connectors List */}
+      {tab === 'skills' ? (
         <div className="w-[300px] border-r border-claude-border flex flex-col flex-shrink-0 bg-claude-bg">
           {/* Header */}
           <div className="h-14 px-4 flex items-center justify-between border-b border-claude-border">
@@ -467,7 +517,63 @@ const CustomizePage = () => {
             )}
           </div>
         </div>
-      )}
+      ) : tab === 'connectors' ? (
+        <div className="w-[300px] border-r border-claude-border flex flex-col flex-shrink-0 bg-claude-bg">
+          <div className="h-14 px-4 flex items-center justify-between border-b border-claude-border">
+            <span className="font-semibold text-claude-text">Connectors</span>
+          </div>
+          <div className="flex-1 overflow-y-auto pt-4 px-2">
+            {/* Connected section */}
+            {githubConnected && (
+              <div className="mb-2">
+                <button className="w-full flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-claude-textSecondary/80 uppercase tracking-wider">
+                  <ChevronDown size={14} className="stroke-[2px] opacity-70" />
+                  Connected
+                </button>
+                <div className="mt-1 px-1 space-y-1">
+                  <div
+                    onClick={() => setSelectedConnector('github')}
+                    className={`flex items-center gap-3 px-3 py-2.5 rounded-[10px] cursor-pointer transition-colors ${selectedConnector === 'github' ? 'bg-claude-hover' : 'hover:bg-claude-hover/50'}`}
+                  >
+                    <Github size={20} className="fill-current stroke-none opacity-80" />
+                    <span className="truncate text-[14px] text-claude-text font-medium">GitHub Integration</span>
+                    <div className="ml-auto w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />
+                  </div>
+                </div>
+              </div>
+            )}
+            {/* Not connected section */}
+            {(!githubConnected || true) && (
+              <div className="mb-2">
+                <button className="w-full flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-claude-textSecondary/80 uppercase tracking-wider">
+                  <ChevronDown size={14} className="stroke-[2px] opacity-70" />
+                  {githubConnected ? 'Available' : 'Not connected'}
+                </button>
+                <div className="mt-1 px-1 space-y-1">
+                  {!githubConnected && (
+                    <div
+                      onClick={() => setSelectedConnector('github')}
+                      className={`flex items-center gap-3 px-3 py-2.5 rounded-[10px] cursor-pointer transition-colors ${selectedConnector === 'github' ? 'bg-claude-hover' : 'hover:bg-claude-hover/50'}`}
+                    >
+                      <Github size={20} className="fill-current stroke-none opacity-80" />
+                      <span className={`truncate text-[14px] ${selectedConnector === 'github' ? 'text-claude-text font-medium' : 'text-claude-textSecondary'}`}>GitHub Integration</span>
+                    </div>
+                  )}
+                  <div
+                    onClick={() => setSelectedConnector('gdrive')}
+                    className={`flex items-center gap-3 px-3 py-2.5 rounded-[10px] cursor-pointer transition-colors ${selectedConnector === 'gdrive' ? 'bg-claude-hover' : 'hover:bg-claude-hover/50'}`}
+                  >
+                    <div className="w-5 h-5 flex items-center justify-center">
+                      <img src="https://upload.wikimedia.org/wikipedia/commons/1/12/Google_Drive_icon_%282020%29.svg" className="w-[18px] h-[18px]" alt="" />
+                    </div>
+                    <span className={`truncate text-[14px] ${selectedConnector === 'gdrive' ? 'text-claude-text font-medium' : 'text-claude-textSecondary'}`}>Google Drive</span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
 
       {/* 3. Right Column: Detail / Create / Overview */}
       <div className="flex-1 flex flex-col min-w-0">
@@ -518,8 +624,63 @@ const CustomizePage = () => {
             </div>
           </div>
         ) : tab === 'connectors' ? (
-          <div className="flex items-center justify-center h-full text-claude-textSecondary text-sm">
-            Connectors coming soon
+          <div className="flex items-center justify-center h-full bg-claude-bg">
+            {selectedConnector === 'github' ? (
+              githubConnected ? (
+                <div className="h-full flex flex-col">
+                  {/* Header */}
+                  <div className="flex items-center justify-between px-8 py-5 border-b border-claude-border">
+                    <div className="flex items-center gap-3">
+                      <Github size={22} className="fill-current stroke-none text-claude-text" />
+                      <span className="text-[17px] font-semibold text-claude-text">GitHub Integration</span>
+                    </div>
+                    <button onClick={handleGithubDisconnect} className="px-4 py-1.5 text-[13px] font-medium text-claude-textSecondary border border-claude-border rounded-lg hover:bg-claude-hover transition-colors">
+                      Disconnect
+                    </button>
+                  </div>
+                  {/* Content */}
+                  <div className="px-8 py-6 overflow-y-auto">
+                    <p className="text-[14px] text-claude-textSecondary mb-6 leading-relaxed">
+                      已连接 GitHub 账号 <span className="text-claude-text font-medium">{githubUser?.login}</span>，Claude 可以访问你的仓库来辅助对话。
+                    </p>
+                    <ul className="space-y-4 text-[14px] text-claude-textSecondary leading-relaxed">
+                      <li>
+                        <span className="text-claude-text font-medium">对话</span> — 提问时可以直接引用仓库中的文件作为上下文。
+                      </li>
+                      <li>
+                        <span className="text-claude-text font-medium">项目</span> — 将仓库文件同步到项目中，让 Claude 始终了解你的代码库。
+                      </li>
+                      <li>
+                        <span className="text-claude-text font-medium">代码</span> — 浏览仓库分支、查看代码、追踪 Pull Request。
+                      </li>
+                      <li>
+                        <span className="text-claude-text font-medium">更多</span> — 支持代码审查、仓库搜索等更多 GitHub 功能。
+                      </li>
+                    </ul>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center h-full mt-[-10vh]">
+                  <div className="w-[68px] h-[68px] bg-black/[0.03] dark:bg-white/[0.04] border border-claude-border rounded-[18px] flex items-center justify-center mb-6 shadow-sm">
+                    <Github size={36} className="text-claude-text fill-current stroke-none" />
+                  </div>
+                  <p className="text-[14px] text-claude-textSecondary mb-6 font-normal">你还没有连接 GitHub。</p>
+                  <button
+                    onClick={handleGithubConnect}
+                    className="px-6 py-2.5 text-[14px] font-medium text-claude-bg bg-claude-text hover:opacity-90 rounded-[10px] transition-colors shadow-sm"
+                  >
+                    连接
+                  </button>
+                </div>
+              )
+            ) : (
+              <div className="flex flex-col items-center mt-[-10vh]">
+                <div className="w-[68px] h-[68px] bg-black/[0.03] dark:bg-white/[0.04] border border-claude-border rounded-[18px] flex items-center justify-center mb-6 shadow-sm">
+                  <img src="https://upload.wikimedia.org/wikipedia/commons/1/12/Google_Drive_icon_%282020%29.svg" className="w-9 h-9" alt="" />
+                </div>
+                <p className="text-[14px] text-claude-textSecondary mb-6 font-normal">Google Drive integration coming soon.</p>
+              </div>
+            )}
           </div>
         ) : creating ? (
           // Create Form

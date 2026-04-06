@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Search, Plus, ChevronDown, ArrowLeft, MoreVertical, Star, ArrowUp, FileText, Trash, Pencil, MessageSquare, X, Upload, Check, AudioLines, ChevronRight } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { getProjects, createProject, getProject, updateProject, deleteProject, uploadProjectFile, deleteProjectFile, createProjectConversation, Project, ProjectFile } from '../api';
+import { getProjects, createProject, getProject, updateProject, deleteProject, uploadProjectFile, deleteProjectFile, createProjectConversation, deleteConversation, Project, ProjectFile } from '../api';
 import ModelSelector, { SelectableModel } from './ModelSelector';
 import { IconPlus } from './Icons';
 import startProjectsImg from '../assets/icons/start-projects.png';
@@ -27,13 +27,35 @@ const ProjectsPage = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Model selector state (same as MainContent)
-  const selectorModels = useMemo<SelectableModel[]>(() => ([
-    { id: 'claude-opus-4-6', name: 'Opus 4.6', enabled: 1 },
-    { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6', enabled: 1 },
-    { id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5', enabled: 1 },
-  ]), []);
-  const [currentModelString, setCurrentModelString] = useState(localStorage.getItem('default_model') || 'claude-sonnet-4-5-20250929-thinking');
+  // Model selector state — load from self-hosted config or use defaults
+  const isSelfHostedMode = localStorage.getItem('user_mode') === 'selfhosted';
+  const selectorModels = useMemo<SelectableModel[]>(() => {
+    if (isSelfHostedMode) {
+      try {
+        const chatModels = JSON.parse(localStorage.getItem('chat_models') || '[]');
+        if (chatModels.length > 0) {
+          const tierDescMap: Record<string, string> = {
+            'opus': 'Most capable for ambitious work',
+            'sonnet': 'Most efficient for everyday tasks',
+            'haiku': 'Fastest for quick answers',
+          };
+          return chatModels.map((m: any) => ({
+            id: m.id,
+            name: m.name || m.id,
+            enabled: 1,
+            tier: m.tier || 'extra',
+            description: m.tier && tierDescMap[m.tier] ? tierDescMap[m.tier] : undefined,
+          }));
+        }
+      } catch (_) {}
+    }
+    return [
+      { id: 'claude-opus-4-6', name: 'Opus 4.6', enabled: 1, description: 'Most capable for ambitious work' },
+      { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6', enabled: 1, description: 'Most efficient for everyday tasks' },
+      { id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5', enabled: 1, description: 'Fastest for quick answers' },
+    ];
+  }, [isSelfHostedMode]);
+  const [currentModelString, setCurrentModelString] = useState(localStorage.getItem('default_model') || 'claude-sonnet-4-6');
   const handleModelChange = (newModelString: string) => {
     setCurrentModelString(newModelString);
   };
@@ -41,8 +63,8 @@ const ProjectsPage = () => {
   const handleChatSubmit = async () => {
     if (!message.trim() || !currentProject) return;
     try {
-      const conv = await createProjectConversation(currentProject.id, message.slice(0, 50));
-      navigate(`/chat/${conv.id}`, { state: { initialMessage: message } });
+      const conv = await createProjectConversation(currentProject.id, message.slice(0, 50), currentModelString);
+      navigate(`/chat/${conv.id}`, { state: { initialMessage: message, model: currentModelString } });
       setMessage('');
     } catch (err) {
       console.error(err);
@@ -81,6 +103,7 @@ const ProjectsPage = () => {
 
   const handleDelete = async () => {
     if (!currentProject) return;
+    if (!window.confirm(`确定要删除项目「${currentProject.name}」吗？所有关联的文件和对话也会被删除。`)) return;
     try {
       await deleteProject(currentProject.id);
       setCurrentProject(null);
@@ -122,6 +145,16 @@ const ProjectsPage = () => {
     } catch (_) { }
   };
 
+  const handleDeleteConversation = async (convId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!currentProject) return;
+    try {
+      await deleteConversation(convId);
+      loadProject(currentProject.id);
+      loadProjects(); // refresh chat_count
+    } catch (_) { }
+  };
+
   const handleRenameSave = async () => {
     if (!currentProject || !editName.trim()) return;
     await updateProject(currentProject.id, { name: editName.trim() });
@@ -130,10 +163,17 @@ const ProjectsPage = () => {
     loadProjects();
   };
 
-  const filteredProjects = projects.filter(p =>
-    p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    p.description.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredProjects = useMemo(() => {
+    const filtered = projects.filter(p =>
+      p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      p.description.toLowerCase().includes(searchQuery.toLowerCase())
+    );
+    return [...filtered].sort((a, b) => {
+      if (sortBy === 'created') return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      // 'activity' and 'edited' both sort by updated_at
+      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    });
+  }, [projects, searchQuery, sortBy]);
 
   // ═══ Project Detail View ═══
   if (currentProject) {
@@ -244,13 +284,20 @@ const ProjectsPage = () => {
                   <div
                     key={conv.id}
                     onClick={() => navigate(`/chat/${conv.id}`)}
-                    className="px-5 py-3 flex items-center gap-3 hover:bg-claude-hover cursor-pointer border-b border-claude-border last:border-b-0 transition-colors"
+                    className="px-5 py-3 flex items-center gap-3 hover:bg-claude-hover cursor-pointer border-b border-claude-border last:border-b-0 transition-colors group"
                   >
                     <MessageSquare size={16} className="text-claude-textSecondary flex-shrink-0" />
                     <span className="text-[14px] text-claude-text truncate">{conv.title}</span>
                     <span className="text-[12px] text-claude-textSecondary ml-auto flex-shrink-0">
                       {new Date(conv.created_at).toLocaleDateString()}
                     </span>
+                    <button
+                      onClick={(e) => handleDeleteConversation(conv.id, e)}
+                      className="p-1 text-claude-textSecondary hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
+                      title="Delete conversation"
+                    >
+                      <Trash size={14} />
+                    </button>
                   </div>
                 ))}
               </div>
@@ -292,7 +339,7 @@ const ProjectsPage = () => {
                     onClick={() => { setEditingInstructions(false); setInstructionsText(currentProject.instructions || ''); }}
                   >
                     <div
-                      className="w-full max-w-[800px] bg-[#2A2A2A] dark:bg-[#2A2928] border border-claude-border rounded-[20px] shadow-2xl p-7"
+                      className="w-full max-w-[800px] bg-white dark:bg-[#2A2928] border border-claude-border rounded-[20px] shadow-2xl p-7"
                       onClick={e => e.stopPropagation()}
                     >
                       <h2 className="text-[20px] font-bold text-claude-text mb-2">Set project instructions</h2>
@@ -305,7 +352,7 @@ const ProjectsPage = () => {
                         value={instructionsText}
                         onChange={e => setInstructionsText(e.target.value)}
                         placeholder="Break down large tasks and ask clarifying questions when needed."
-                        className="w-full h-[400px] px-4 py-3 bg-[#2A2928] dark:bg-[#202020] border border-claude-border rounded-[12px] text-[15px] text-claude-text resize-none outline-none focus:border-[#3A7ADA] focus:ring-1 focus:ring-[#3A7ADA] transition-colors"
+                        className="w-full h-[400px] px-4 py-3 bg-claude-bg dark:bg-[#202020] border border-claude-border rounded-[12px] text-[15px] text-claude-text resize-none outline-none focus:border-[#3A7ADA] focus:ring-1 focus:ring-[#3A7ADA] transition-colors"
                       />
 
                       <div className="flex justify-end gap-3 mt-5">
@@ -482,25 +529,26 @@ const ProjectsPage = () => {
           <h1 className="font-[Spectral] text-[32px] text-claude-text" style={{ fontWeight: 500 }}>Projects</h1>
           <button
             onClick={() => setIsCreating(true)}
-            className="flex items-center gap-2 px-3 py-1.5 bg-claude-text text-claude-bg hover:opacity-90 rounded-xl transition-opacity font-medium text-[14px]"
+            className="flex items-center gap-2 px-3.5 py-1.5 bg-claude-text text-claude-bg hover:opacity-90 rounded-lg transition-opacity font-medium"
+            style={{ fontSize: '14px' }}
           >
-            <Plus size={18} strokeWidth={2.5} />
+            <Plus size={16} strokeWidth={2.5} />
             New project
           </button>
         </div>
 
         {projects.length > 0 && (
           <>
-            <div className="flex items-center relative mb-4">
-              <div className="absolute inset-y-0 left-4 flex items-center pointer-events-none">
-                <Search className="h-[18px] w-[18px] text-claude-textSecondary" />
+            <div className="relative mb-6">
+              <div className="absolute inset-y-0 left-3 flex items-center pointer-events-none">
+                <Search className="h-5 w-5 text-claude-textSecondary opacity-80" />
               </div>
               <input
                 type="text"
                 placeholder="Search projects..."
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
-                className="w-full pl-11 pr-4 py-3 bg-claude-bgSecondary border border-claude-border rounded-[14px] text-claude-text placeholder-claude-textSecondary focus:outline-none focus:border-claude-border focus:ring-1 focus:ring-claude-border transition-all text-[15px]"
+                className="w-full pl-10 pr-4 py-3 bg-white dark:bg-claude-input border border-gray-200 dark:border-claude-border rounded-xl text-claude-text placeholder-claude-textSecondary focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all text-[15px]"
               />
             </div>
 

@@ -127,12 +127,21 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const [isRecentsCollapsed, setIsRecentsCollapsed] = useState(false);
   const [isNewChatAnimating, setIsNewChatAnimating] = useState(false);
   const [streamingIds, setStreamingIds] = useState<Set<string>>(new Set());
+  const [updateStatus, setUpdateStatus] = useState<{ type: string; version?: string; percent?: number } | null>(null);
 
   // Listen for streaming state changes
   useEffect(() => {
     const handler = () => setStreamingIds(new Set(getStreamingIds()));
     window.addEventListener('streaming-change', handler);
     return () => window.removeEventListener('streaming-change', handler);
+  }, []);
+
+  // Listen for auto-update events
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (api?.onUpdateStatus) {
+      api.onUpdateStatus((status: any) => setUpdateStatus(status));
+    }
   }, []);
 
   const menuRef = useRef<HTMLDivElement>(null);
@@ -172,6 +181,10 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     }
     if (label === 'Projects') {
       navigate('/projects');
+      return;
+    }
+    if (label === 'Artifacts') {
+      navigate('/artifacts');
       return;
     }
     if (label === 'Code') {
@@ -408,7 +421,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             </div>
             <span
               className={`font-medium leading-none transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
-              style={{ fontSize: '15px' }}
+              style={{ fontSize: '14px' }}
             >
               New chat
             </span>
@@ -445,7 +458,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             </div>
             <span
               className={`font-medium leading-none transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
-              style={{ fontSize: '15px' }}
+              style={{ fontSize: '14px' }}
             >
               Search
             </span>
@@ -482,7 +495,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             </div>
             <span
               className={`font-medium leading-none transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
-              style={{ fontSize: '15px' }}
+              style={{ fontSize: '14px' }}
             >
               Customize
             </span>
@@ -519,7 +532,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                 </div>
                 <span
                   className={`leading-none transition-opacity duration-200 text-left ${isCollapsed ? 'opacity-0 w-0 hidden' : 'opacity-100 block'}`}
-                  style={{ fontSize: '15px' }}
+                  style={{ fontSize: '14px' }}
                 >
                   {item.label}
                 </span>
@@ -602,9 +615,48 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
 
         </div>
 
+        {/* Update status banner */}
+        {updateStatus && !isCollapsed && (updateStatus.type === 'available' || updateStatus.type === 'progress' || updateStatus.type === 'downloaded') && (
+          <div className="mx-3 mb-2 mt-auto">
+            {(updateStatus.type === 'available' || updateStatus.type === 'progress') && (
+              <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-claude-hover">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-claude-textSecondary flex-shrink-0 animate-spin">
+                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                </svg>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[12px] text-claude-textSecondary leading-tight">
+                    Downloading update...{updateStatus.percent != null ? ` ${updateStatus.percent}%` : ''}
+                  </div>
+                  {updateStatus.percent != null && (
+                    <div className="mt-1.5 h-[3px] rounded-full bg-claude-border overflow-hidden">
+                      <div className="h-full rounded-full bg-claude-textSecondary transition-all duration-300" style={{ width: `${updateStatus.percent}%` }} />
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+            {updateStatus.type === 'downloaded' && (
+              <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-claude-hover">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-green-500 flex-shrink-0">
+                  <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" /><path d="m9 12 2 2 4-4" />
+                </svg>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[12px] text-claude-text font-medium leading-tight">Updated to {updateStatus.version}</div>
+                  <button
+                    onClick={() => { const api = (window as any).electronAPI; api?.installUpdate?.(); }}
+                    className="text-[12px] text-claude-textSecondary hover:text-claude-text transition-colors mt-0.5"
+                  >
+                    Relaunch to apply
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* User Profile Footer */}
         <div
-          className="mt-auto border-t border-claude-border flex-shrink-0 relative transition-all duration-200"
+          className={`${!updateStatus || isCollapsed || (updateStatus.type !== 'available' && updateStatus.type !== 'progress' && updateStatus.type !== 'downloaded') ? 'mt-auto' : ''} border-t border-claude-border flex-shrink-0 relative transition-all duration-200`}
           style={{
             paddingTop: `${tunerConfig?.profilePy || 12}px`,
             paddingBottom: `${tunerConfig?.profilePy || 12}px`,
@@ -640,7 +692,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                 >
                   {userUser?.display_name || userUser?.full_name || userUser?.nickname || 'User'}
                 </div>
-                <div className="text-[13px] text-claude-textSecondary mt-1 leading-tight">{planLabel}</div>
+                <div className="text-[13px] text-claude-textSecondary mt-1 leading-tight">{localStorage.getItem('user_mode') === 'selfhosted' ? 'Self-hosted' : planLabel}</div>
               </div>
               <ChevronUp size={16} className="text-claude-textSecondary shrink-0 ml-1" />
             </div>
@@ -665,14 +717,16 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                   <Settings size={16} className="text-claude-textSecondary" />
                   Settings
                 </button>
-                <button
-                  className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"
-                  onClick={() => { setShowUserMenu(false); onOpenUpgrade?.(); }}
-                >
-                  <CreditCard size={16} className="text-claude-textSecondary" />
-                  Payment
-                </button>
-                {isAdmin && (
+                {localStorage.getItem('user_mode') !== 'selfhosted' && (
+                  <button
+                    className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"
+                    onClick={() => { setShowUserMenu(false); onOpenUpgrade?.(); }}
+                  >
+                    <CreditCard size={16} className="text-claude-textSecondary" />
+                    Payment
+                  </button>
+                )}
+                {isAdmin && localStorage.getItem('user_mode') !== 'selfhosted' && (
                   <button
                     className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"
                     onClick={() => { setShowUserMenu(false); navigate('/admin'); }}

@@ -446,6 +446,16 @@ export async function getConversations() {
   return res.json();
 }
 
+export async function getUserArtifacts() {
+  const res = await request('/artifacts');
+  return res.json();
+}
+
+export async function getArtifactContent(filePath: string) {
+  const res = await request('/artifacts/content?path=' + encodeURIComponent(filePath));
+  return res.json();
+}
+
 export async function createConversation(title?: string, model?: string) {
   const body: any = { model };
   if (title !== undefined) {
@@ -608,6 +618,34 @@ export async function answerUserQuestion(
     method: 'POST',
     body: JSON.stringify({ request_id: requestId, tool_use_id: toolUseId, answers }),
   });
+  return res.json();
+}
+
+// ===== Provider Management =====
+export interface ProviderModel { id: string; name: string; enabled?: boolean; }
+export interface Provider {
+  id: string; name: string; apiKey: string; baseUrl: string;
+  format: 'anthropic' | 'openai'; models: ProviderModel[]; enabled: boolean;
+  icon?: string;
+}
+
+export async function getProviders(): Promise<Provider[]> {
+  const res = await fetch(`${API_BASE}/providers`);
+  return res.json();
+}
+export async function createProvider(p: Partial<Provider>): Promise<Provider> {
+  const res = await fetch(`${API_BASE}/providers`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+  return res.json();
+}
+export async function updateProvider(id: string, p: Partial<Provider>): Promise<Provider> {
+  const res = await fetch(`${API_BASE}/providers/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+  return res.json();
+}
+export async function deleteProvider(id: string): Promise<void> {
+  await fetch(`${API_BASE}/providers/${id}`, { method: 'DELETE' });
+}
+export async function getProviderModels(): Promise<Array<{ id: string; name: string; providerId: string; providerName: string }>> {
+  const res = await fetch(`${API_BASE}/providers/models`);
   return res.json();
 }
 
@@ -845,6 +883,27 @@ export async function toggleSkill(id: string, enabled: boolean) {
   return res.json();
 }
 
+// GitHub Connector
+export async function getGithubStatus() {
+  const res = await fetch(`${API_BASE}/github/status`);
+  return res.json();
+}
+
+export async function getGithubAuthUrl() {
+  const res = await fetch(`${API_BASE}/github/auth-url`);
+  return res.json();
+}
+
+export async function disconnectGithub() {
+  const res = await fetch(`${API_BASE}/github/disconnect`, { method: 'POST' });
+  return res.json();
+}
+
+export async function getGithubRepos(page = 1) {
+  const res = await fetch(`${API_BASE}/github/repos?page=${page}`);
+  return res.json();
+}
+
 // 流式对话（核心）
 export async function sendMessage(
   conversationId: string,
@@ -876,7 +935,16 @@ export async function sendMessage(
         message,
         attachments: attachments || undefined,
         env_token: localStorage.getItem('CUSTOM_API_KEY') || localStorage.getItem('ANTHROPIC_API_KEY') || undefined,
-        env_base_url: localStorage.getItem('CUSTOM_BASE_URL') || localStorage.getItem('ANTHROPIC_BASE_URL') || undefined
+        env_base_url: localStorage.getItem('CUSTOM_BASE_URL') || localStorage.getItem('ANTHROPIC_BASE_URL') || undefined,
+        user_mode: localStorage.getItem('user_mode') || 'clawparrot',
+        user_profile: (() => {
+          try {
+            const p = JSON.parse(localStorage.getItem('user_profile') || localStorage.getItem('user') || '{}');
+            const wf = p.work_function;
+            const pp = p.personal_preferences;
+            return (wf || pp) ? { work_function: wf, personal_preferences: pp } : undefined;
+          } catch { return undefined; }
+        })(),
       }),
       signal,
     });

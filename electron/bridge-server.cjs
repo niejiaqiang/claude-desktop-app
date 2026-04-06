@@ -15,11 +15,16 @@ function enableNodeModeForChildProcesses() {
 
 // Load custom system prompt (only affects this Electron app, not external CLI usage)
 const CUSTOM_SYSTEM_PROMPT_PATH = path.join(__dirname, 'system-prompt.txt');
-let customSystemPrompt = '';
+let customSystemPromptFull = '';  // Full prompt including anti-Kiro sections (for Clawparrot)
+let customSystemPromptClean = ''; // Without anti-Kiro sections (for self-hosted)
 try {
     if (fs.existsSync(CUSTOM_SYSTEM_PROMPT_PATH)) {
-        customSystemPrompt = fs.readFileSync(CUSTOM_SYSTEM_PROMPT_PATH, 'utf8');
-        console.log(`[System Prompt] Loaded custom prompt (${customSystemPrompt.length} chars) from ${CUSTOM_SYSTEM_PROMPT_PATH}`);
+        customSystemPromptFull = fs.readFileSync(CUSTOM_SYSTEM_PROMPT_PATH, 'utf8');
+        // Strip <override_instructions> and <identity> blocks for self-hosted users
+        customSystemPromptClean = customSystemPromptFull
+            .replace(/<override_instructions>[\s\S]*?<\/override_instructions>\s*/g, '')
+            .replace(/<identity>[\s\S]*?<\/identity>\s*/g, '');
+        console.log(`[System Prompt] Loaded (full=${customSystemPromptFull.length}, clean=${customSystemPromptClean.length} chars)`);
     } else {
         console.warn('[System Prompt] Custom prompt file not found at:', CUSTOM_SYSTEM_PROMPT_PATH);
     }
@@ -71,11 +76,27 @@ function initServer(mainWindow) {
     // Setup paths
     const userDataPath = app.getPath('userData');
     const dbPath = path.join(userDataPath, 'claude-desktop.json');
-    const workspacesDir = path.join(userDataPath, 'workspaces');
+
+    // Workspace: use user-chosen path, or default to ~/Documents/Claude Desktop
+    const defaultWorkspacesDir = path.join(app.getPath('documents'), 'Claude Desktop');
+    // Read saved preference (set by onboarding or settings)
+    let workspacesDir;
+    try {
+        const settingsPath = path.join(userDataPath, 'workspace-config.json');
+        if (fs.existsSync(settingsPath)) {
+            const cfg = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+            workspacesDir = cfg.workspacesDir || defaultWorkspacesDir;
+        } else {
+            workspacesDir = defaultWorkspacesDir;
+        }
+    } catch (_) {
+        workspacesDir = defaultWorkspacesDir;
+    }
 
     if (!fs.existsSync(workspacesDir)) {
         fs.mkdirSync(workspacesDir, { recursive: true });
     }
+    console.log('[Workspace]', workspacesDir);
 
     // Initialize DB
     let db = { conversations: [], messages: [], projects: [], project_files: [] };
@@ -90,7 +111,300 @@ function initServer(mainWindow) {
     }
     const saveDb = () => fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
 
-    async function generateTitleAsync(conversationId, userMsg, assistantMsg, token, baseUrl, activeModel) {
+    // ===== Provider Management =====
+    const providersPath = path.join(userDataPath, 'providers.json');
+    let providers = [];
+    try {
+        if (fs.existsSync(providersPath)) {
+            providers = JSON.parse(fs.readFileSync(providersPath, 'utf8'));
+        }
+    } catch (_) {}
+    const saveProviders = () => fs.writeFileSync(providersPath, JSON.stringify(providers, null, 2));
+
+    // Resolve provider + key + url for a given model ID
+    function resolveProvider(modelId) {
+        // Search all enabled providers for this model
+        for (const p of providers) {
+            if (!p.enabled) continue;
+            if (p.models && p.models.some(m => m.id === modelId && m.enabled !== false)) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    // ===== URL normalization helper =====
+    // Strips known endpoint suffixes so base URLs like
+    // "https://api.siliconflow.cn/v1/chat/completions" become "https://api.siliconflow.cn/v1"
+    function normalizeBaseUrl(url) {
+        if (!url) return url;
+        let clean = url.replace(/\/+$/, '');
+        clean = clean.replace(/\/(chat\/completions|messages)$/, '');
+        return clean.replace(/\/+$/, '');
+    }
+
+    // ===== OpenAI→Anthropic Conversion Proxy =====
+    // Runs on a dynamic port; engine points ANTHROPIC_BASE_URL to it
+    // The proxy receives Anthropic-format requests, converts to OpenAI format, calls the real endpoint
+    const http = require('http');
+    let proxyPort = 0;
+
+    // Stored per-request: the proxy reads these to know where to forward
+    let proxyTarget = { apiKey: '', baseUrl: '', model: '', format: 'anthropic' };
+
+    const proxyServer = http.createServer(async (req, res) => {
+        if (req.method === 'POST' && req.url.includes('/messages')) {
+            let body = '';
+            req.on('data', c => body += c);
+            req.on('end', async () => {
+                try {
+                    const anthropicReq = JSON.parse(body);
+                    const target = proxyTarget;
+
+                    if (target.format === 'openai') {
+                        // Convert Anthropic → OpenAI format
+                        const openaiMessages = [];
+                        if (anthropicReq.system) {
+                            const sysText = Array.isArray(anthropicReq.system)
+                                ? anthropicReq.system.map(b => typeof b === 'string' ? b : b.text || '').join('\n')
+                                : anthropicReq.system;
+                            openaiMessages.push({ role: 'system', content: sysText });
+                        }
+                        for (const msg of (anthropicReq.messages || [])) {
+                            if (msg.role === 'user') {
+                                // User messages may contain tool_result blocks
+                                const parts = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content }];
+                                const textParts = parts.filter(b => b.type === 'text').map(b => b.text || '');
+                                const toolResults = parts.filter(b => b.type === 'tool_result');
+                                if (toolResults.length > 0) {
+                                    for (const tr of toolResults) {
+                                        const trContent = Array.isArray(tr.content) ? tr.content.map(b => b.text || '').join('') : (tr.content || '');
+                                        openaiMessages.push({ role: 'tool', tool_call_id: tr.tool_use_id, content: trContent });
+                                    }
+                                }
+                                if (textParts.join('').trim()) {
+                                    openaiMessages.push({ role: 'user', content: textParts.join('') });
+                                }
+                            } else if (msg.role === 'assistant') {
+                                const parts = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content }];
+                                const textContent = parts.filter(b => b.type === 'text').map(b => b.text || '').join('');
+                                const toolUses = parts.filter(b => b.type === 'tool_use');
+                                if (toolUses.length > 0) {
+                                    openaiMessages.push({
+                                        role: 'assistant',
+                                        content: textContent || null,
+                                        tool_calls: toolUses.map(tu => ({
+                                            id: tu.id, type: 'function',
+                                            function: { name: tu.name, arguments: JSON.stringify(tu.input || {}) }
+                                        }))
+                                    });
+                                } else {
+                                    openaiMessages.push({ role: 'assistant', content: textContent });
+                                }
+                            }
+                        }
+
+                        // Convert Anthropic tools → OpenAI tools
+                        const openaiTools = (anthropicReq.tools || []).map(t => ({
+                            type: 'function',
+                            function: {
+                                name: t.name,
+                                description: t.description || '',
+                                parameters: t.input_schema || { type: 'object', properties: {} },
+                            }
+                        }));
+
+                        const openaiBody = {
+                            model: target.model || anthropicReq.model,
+                            messages: openaiMessages,
+                            max_tokens: anthropicReq.max_tokens || 4096,
+                            stream: true,
+                        };
+                        if (openaiTools.length > 0) openaiBody.tools = openaiTools;
+                        if (anthropicReq.temperature != null) openaiBody.temperature = anthropicReq.temperature;
+
+                        let endpoint = normalizeBaseUrl(target.baseUrl);
+                        if (!endpoint.endsWith('/v1')) endpoint += '/v1';
+                        endpoint += '/chat/completions';
+
+                        const fetchController = new AbortController();
+                        const fetchTimeout = setTimeout(() => fetchController.abort(), 120000); // 2 min timeout
+                        let upstreamRes;
+                        try {
+                            upstreamRes = await fetch(endpoint, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + target.apiKey },
+                                body: JSON.stringify(openaiBody),
+                                signal: fetchController.signal,
+                            });
+                        } catch (fetchErr) {
+                            clearTimeout(fetchTimeout);
+                            console.error('[Proxy] Fetch error:', fetchErr.message || fetchErr);
+                            res.writeHead(502, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Failed to connect to upstream: ' + (fetchErr.message || 'timeout') } }));
+                            return;
+                        }
+                        clearTimeout(fetchTimeout);
+
+                        if (!upstreamRes.ok) {
+                            const errText = await upstreamRes.text();
+                            res.writeHead(upstreamRes.status, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: errText.slice(0, 500) } }));
+                            return;
+                        }
+
+                        // Stream OpenAI SSE → convert to Anthropic SSE format
+                        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+
+                        // Send message_start
+                        res.write('event: message_start\ndata: ' + JSON.stringify({
+                            type: 'message_start',
+                            message: { id: 'msg_proxy', type: 'message', role: 'assistant', content: [], model: target.model, usage: { input_tokens: 0, output_tokens: 0 } }
+                        }) + '\n\n');
+
+                        const reader = upstreamRes.body.getReader();
+                        const decoder = new TextDecoder();
+                        let sseBuffer = '';
+                        let totalTokens = 0;
+                        let contentBlockIndex = 0;
+                        let textBlockStarted = false;
+                        // Track tool_calls being streamed (OpenAI streams them incrementally)
+                        const pendingToolCalls = new Map(); // index → { id, name, args }
+
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            sseBuffer += decoder.decode(value, { stream: true });
+                            const lines = sseBuffer.split('\n');
+                            sseBuffer = lines.pop() || '';
+                            for (const line of lines) {
+                                if (!line.startsWith('data: ')) continue;
+                                const data = line.slice(6).trim();
+                                if (data === '[DONE]') continue;
+                                try {
+                                    const chunk = JSON.parse(data);
+                                    const delta = chunk.choices?.[0]?.delta;
+                                    const finishReason = chunk.choices?.[0]?.finish_reason;
+
+                                    // Text content
+                                    if (delta?.content) {
+                                        if (!textBlockStarted) {
+                                            res.write('event: content_block_start\ndata: ' + JSON.stringify({
+                                                type: 'content_block_start', index: contentBlockIndex, content_block: { type: 'text', text: '' }
+                                            }) + '\n\n');
+                                            textBlockStarted = true;
+                                        }
+                                        res.write('event: content_block_delta\ndata: ' + JSON.stringify({
+                                            type: 'content_block_delta', index: contentBlockIndex, delta: { type: 'text_delta', text: delta.content }
+                                        }) + '\n\n');
+                                    }
+
+                                    // Tool calls (OpenAI streams them as delta.tool_calls[])
+                                    if (delta?.tool_calls) {
+                                        for (const tc of delta.tool_calls) {
+                                            const tcIdx = tc.index ?? 0;
+                                            if (!pendingToolCalls.has(tcIdx)) {
+                                                // Close text block if open
+                                                if (textBlockStarted) {
+                                                    res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: contentBlockIndex }) + '\n\n');
+                                                    contentBlockIndex++;
+                                                    textBlockStarted = false;
+                                                }
+                                                pendingToolCalls.set(tcIdx, { id: tc.id || ('call_' + tcIdx), name: tc.function?.name || '', args: '' });
+                                                // Send content_block_start for tool_use
+                                                const ptc = pendingToolCalls.get(tcIdx);
+                                                res.write('event: content_block_start\ndata: ' + JSON.stringify({
+                                                    type: 'content_block_start', index: contentBlockIndex + tcIdx,
+                                                    content_block: { type: 'tool_use', id: ptc.id, name: ptc.name, input: {} }
+                                                }) + '\n\n');
+                                            }
+                                            const ptc = pendingToolCalls.get(tcIdx);
+                                            if (tc.function?.name && !ptc.name) ptc.name = tc.function.name;
+                                            if (tc.function?.arguments) ptc.args += tc.function.arguments;
+                                        }
+                                    }
+
+                                    // On finish, close all pending tool calls
+                                    if (finishReason === 'tool_calls' || finishReason === 'stop') {
+                                        if (textBlockStarted) {
+                                            res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: contentBlockIndex }) + '\n\n');
+                                            contentBlockIndex++;
+                                            textBlockStarted = false;
+                                        }
+                                        for (const [tcIdx, ptc] of pendingToolCalls) {
+                                            // Send input_json_delta with complete input
+                                            let parsedInput = {};
+                                            try { parsedInput = JSON.parse(ptc.args); } catch (_) {}
+                                            res.write('event: content_block_delta\ndata: ' + JSON.stringify({
+                                                type: 'content_block_delta', index: contentBlockIndex + tcIdx,
+                                                delta: { type: 'input_json_delta', partial_json: ptc.args }
+                                            }) + '\n\n');
+                                            res.write('event: content_block_stop\ndata: ' + JSON.stringify({
+                                                type: 'content_block_stop', index: contentBlockIndex + tcIdx
+                                            }) + '\n\n');
+                                        }
+                                    }
+
+                                    if (chunk.usage) totalTokens = chunk.usage.total_tokens || 0;
+                                } catch (_) {}
+                            }
+                        }
+
+                        // Close any remaining open blocks
+                        if (textBlockStarted) {
+                            res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: contentBlockIndex }) + '\n\n');
+                        }
+
+                        // Send message_delta + message_stop
+                        const stopReason = pendingToolCalls.size > 0 ? 'tool_use' : 'end_turn';
+                        res.write('event: message_delta\ndata: ' + JSON.stringify({
+                            type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: totalTokens }
+                        }) + '\n\n');
+                        res.write('event: message_stop\ndata: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n');
+                        res.end();
+                    } else {
+                        // Anthropic format — passthrough to real endpoint
+                        let endpoint = normalizeBaseUrl(target.baseUrl);
+                        if (!endpoint.endsWith('/v1')) endpoint += '/v1';
+                        endpoint += '/messages';
+
+                        const upstreamRes = await fetch(endpoint, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'x-api-key': target.apiKey,
+                                'anthropic-version': '2023-06-01',
+                            },
+                            body: body,
+                        });
+                        res.writeHead(upstreamRes.status, Object.fromEntries(upstreamRes.headers.entries()));
+                        const reader = upstreamRes.body.getReader();
+                        const pump = async () => {
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) { res.end(); break; }
+                                res.write(value);
+                            }
+                        };
+                        await pump();
+                    }
+                } catch (err) {
+                    console.error('[Proxy] Error:', err.message);
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: err.message } }));
+                }
+            });
+        } else {
+            res.writeHead(404);
+            res.end('Not found');
+        }
+    });
+    proxyServer.listen(0, '127.0.0.1', () => {
+        proxyPort = proxyServer.address().port;
+        console.log('[Proxy] OpenAI conversion proxy on port', proxyPort);
+    });
+
+    async function generateTitleAsync(conversationId, userMsg, assistantMsg, token, baseUrl, activeModel, apiFormat) {
         if (!token) { console.log('[Title] Skipped: no API token'); return; }
         try {
             const bConv = db.conversations.find(c => c.id === conversationId);
@@ -99,50 +413,95 @@ function initServer(mainWindow) {
             // Strip -thinking suffix — raw API doesn't accept it
             let modelId = (activeModel || 'claude-sonnet-4-6').replace(/-thinking$/, '');
 
-            // Build endpoint: handle base URLs that already contain /v1
-            let endpoint;
-            if (baseUrl) {
-                const clean = baseUrl.replace(/\/+$/, '');
-                endpoint = clean.endsWith('/v1') ? `${clean}/messages` : `${clean}/v1/messages`;
-            } else {
-                endpoint = 'https://api.anthropic.com/v1/messages';
-            }
+            const titlePrompt = `请根据这段对话生成一个简短的标题（最多5-7个字，不要用引号），概括对话的主题：\n\n用户：${userMsg}\n助手：${assistantMsg}\n\n标题：`;
 
-            console.log(`[Title] Generating for ${conversationId} via ${endpoint} model=${modelId}`);
-            const response = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    'x-api-key': token,
-                    'anthropic-version': '2023-06-01'
-                },
-                body: JSON.stringify({
-                    model: modelId,
-                    max_tokens: 50,
-                    system: 'You are a title generator. Respond only with the title, without any quotes or explanations. Maximum 5-7 words.',
-                    messages: [
-                        { role: 'user', content: `请根据这段对话生成一个简短的标题（最多5-7个字，不要用引号），概括对话的主题：\n\n用户：${userMsg}\n助手：${assistantMsg}\n\n标题：` }
-                    ]
-                })
-            });
-            if (response.ok) {
-                const data = await response.json();
-                let title = null;
-                if (data.content && Array.isArray(data.content)) {
-                    const textBlock = data.content.find(b => b.type === 'text' && b.text);
-                    if (textBlock && textBlock.text) {
-                        title = textBlock.text.replace(/^["']|["']$/g, '').trim();
+            if (apiFormat === 'openai') {
+                // OpenAI format title generation
+                let endpoint = normalizeBaseUrl(baseUrl);
+                if (!endpoint.endsWith('/v1')) endpoint += '/v1';
+                endpoint += '/chat/completions';
+
+                console.log(`[Title] Generating (OpenAI) for ${conversationId} via ${endpoint} model=${modelId}`);
+                const titleController = new AbortController();
+                const titleTimeout = setTimeout(() => titleController.abort(), 30000);
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Authorization': 'Bearer ' + token },
+                    body: JSON.stringify({
+                        model: modelId,
+                        max_tokens: 50,
+                        messages: [
+                            { role: 'system', content: 'You are a title generator. Respond only with the title, without any quotes or explanations. Maximum 5-7 words.' },
+                            { role: 'user', content: titlePrompt }
+                        ]
+                    }),
+                    signal: titleController.signal,
+                });
+                clearTimeout(titleTimeout);
+                if (response.ok) {
+                    const buf = await response.arrayBuffer();
+                    const data = JSON.parse(new TextDecoder('utf-8').decode(buf));
+                    const title = data.choices?.[0]?.message?.content?.replace(/^["']|["']$/g, '').trim();
+                    if (title) {
+                        bConv.title = title;
+                        saveDb();
+                        console.log(`[Title] Success: "${title}"`);
+                    } else {
+                        console.error('[Title] No text in OpenAI response:', JSON.stringify(data));
                     }
-                }
-                if (title) {
-                    bConv.title = title;
-                    saveDb();
-                    console.log(`[Title] Success: "${title}"`);
                 } else {
-                    console.error('[Title] No text in response:', JSON.stringify(data));
+                    console.error('[Title] HTTP Error:', response.status, endpoint, await response.text());
                 }
             } else {
-                console.error('[Title] HTTP Error:', response.status, endpoint, await response.text());
+                // Anthropic format title generation
+                let endpoint;
+                if (baseUrl) {
+                    const clean = normalizeBaseUrl(baseUrl);
+                    endpoint = clean.endsWith('/v1') ? `${clean}/messages` : `${clean}/v1/messages`;
+                } else {
+                    endpoint = 'https://api.anthropic.com/v1/messages';
+                }
+
+                console.log(`[Title] Generating for ${conversationId} via ${endpoint} model=${modelId}`);
+                const anthTitleCtrl = new AbortController();
+                const anthTitleTimeout = setTimeout(() => anthTitleCtrl.abort(), 30000);
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json; charset=utf-8',
+                        'x-api-key': token,
+                        'anthropic-version': '2023-06-01'
+                    },
+                    signal: anthTitleCtrl.signal,
+                    body: JSON.stringify({
+                        model: modelId,
+                        max_tokens: 50,
+                        system: 'You are a title generator. Respond only with the title, without any quotes or explanations. Maximum 5-7 words.',
+                        messages: [
+                            { role: 'user', content: titlePrompt }
+                        ]
+                    })
+                });
+                clearTimeout(anthTitleTimeout);
+                if (response.ok) {
+                    const data = await response.json();
+                    let title = null;
+                    if (data.content && Array.isArray(data.content)) {
+                        const textBlock = data.content.find(b => b.type === 'text' && b.text);
+                        if (textBlock && textBlock.text) {
+                            title = textBlock.text.replace(/^["']|["']$/g, '').trim();
+                        }
+                    }
+                    if (title) {
+                        bConv.title = title;
+                        saveDb();
+                        console.log(`[Title] Success: "${title}"`);
+                    } else {
+                        console.error('[Title] No text in response:', JSON.stringify(data));
+                    }
+                } else {
+                    console.error('[Title] HTTP Error:', response.status, endpoint, await response.text());
+                }
             }
         } catch (e) {
             console.error('[Title] Exception:', e.message || e);
@@ -329,6 +688,60 @@ function initServer(mainWindow) {
 
     // ═══════════════════ Conversations ═══════════════════
 
+    // ===== Artifacts API =====
+    // Scans all messages for Write tool calls that created renderable HTML files
+    server.get('/api/artifacts', (req, res) => {
+        const artifacts = [];
+        const htmlExts = ['.html', '.htm'];
+        for (const msg of db.messages) {
+            if (!msg.toolCalls) continue;
+            for (const tc of msg.toolCalls) {
+                if (tc.name !== 'Write' || tc.status === 'error') continue;
+                const fp = tc.input?.file_path;
+                if (!fp) continue;
+                const ext = path.extname(fp).toLowerCase();
+                if (!htmlExts.includes(ext)) continue;
+                // Read file content to verify it's renderable HTML
+                let content = '';
+                try { content = fs.readFileSync(fp, 'utf-8'); } catch { continue; }
+                const trimmed = content.trimStart().slice(0, 100).toLowerCase();
+                if (!trimmed.includes('<!doctype') && !trimmed.includes('<html') && !trimmed.includes('<head') && !trimmed.includes('<body')) continue;
+                const conv = db.conversations.find(c => c.id === msg.conversation_id);
+                artifacts.push({
+                    id: tc.id,
+                    title: path.basename(fp),
+                    file_path: fp,
+                    conversation_id: msg.conversation_id,
+                    conversation_title: conv?.title || 'Untitled',
+                    message_id: msg.id,
+                    created_at: msg.created_at,
+                    content_length: content.length,
+                });
+            }
+        }
+        // Sort newest first, deduplicate by file_path (keep latest)
+        artifacts.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        const seen = new Set();
+        const unique = artifacts.filter(a => {
+            if (seen.has(a.file_path)) return false;
+            seen.add(a.file_path);
+            return true;
+        });
+        res.json(unique);
+    });
+
+    // Get artifact content by file path
+    server.get('/api/artifacts/content', (req, res) => {
+        const fp = req.query.path;
+        if (!fp) return res.status(400).json({ error: 'Missing path' });
+        try {
+            const content = fs.readFileSync(fp, 'utf-8');
+            res.json({ content, format: 'html', title: path.basename(fp) });
+        } catch {
+            res.status(404).json({ error: 'File not found' });
+        }
+    });
+
     server.get('/api/conversations', (req, res) => {
         // Filter: only return non-project conversations (project convs accessed via /projects/:id/conversations)
         const projectId = req.query.project_id;
@@ -344,7 +757,7 @@ function initServer(mainWindow) {
 
     server.post('/api/conversations', (req, res) => {
         const id = uuidv4();
-        const { title = 'New Conversation', model = 'claude-3-5-sonnet', project_id } = req.body;
+        const { title = 'New Conversation', model = 'claude-sonnet-4-6', project_id } = req.body;
         const workspacePath = path.join(workspacesDir, id);
 
         if (!fs.existsSync(workspacePath)) {
@@ -418,6 +831,18 @@ function initServer(mainWindow) {
             // (engine sessions are model-bound; resuming with a different model causes context loss)
             conv.claude_session_id = null;
             console.log('[Session] Reset for conv', conv.id, '(model changed to', conv.model + ')');
+        }
+        // Move conversation to/from a project
+        if ('project_id' in req.body) {
+            const pid = req.body.project_id;
+            if (pid) {
+                const project = db.projects.find(p => p.id === pid);
+                if (!project) return res.status(404).json({ error: 'Project not found' });
+                conv.project_id = pid;
+                project.updated_at = new Date().toISOString();
+            } else {
+                delete conv.project_id;
+            }
         }
 
         saveDb();
@@ -785,6 +1210,64 @@ function initServer(mainWindow) {
         req.on('close', () => stream.listeners.delete(res));
     });
 
+    // ===== Provider CRUD =====
+    server.get('/api/providers', (req, res) => {
+        res.json(providers);
+    });
+    server.post('/api/providers', (req, res) => {
+        const p = req.body;
+        p.id = uuidv4();
+        if (!p.name) return res.status(400).json({ error: 'Missing name' });
+        if (!p.models) p.models = [];
+        if (p.enabled === undefined) p.enabled = true;
+        if (p.baseUrl) p.baseUrl = normalizeBaseUrl(p.baseUrl);
+        providers.push(p);
+        saveProviders();
+        res.json(p);
+    });
+    server.patch('/api/providers/:id', (req, res) => {
+        const p = providers.find(x => x.id === req.params.id);
+        if (!p) return res.status(404).json({ error: 'Not found' });
+        if (req.body.baseUrl) req.body.baseUrl = normalizeBaseUrl(req.body.baseUrl);
+        Object.assign(p, req.body);
+        delete p._id; // prevent duplication
+        saveProviders();
+        res.json(p);
+    });
+    server.delete('/api/providers/:id', (req, res) => {
+        providers = providers.filter(x => x.id !== req.params.id);
+        saveProviders();
+        res.json({ ok: true });
+    });
+    // Get all available models across all enabled providers
+    server.get('/api/providers/models', (req, res) => {
+        const models = [];
+        for (const p of providers) {
+            if (!p.enabled) continue;
+            for (const m of (p.models || [])) {
+                if (m.enabled === false) continue;
+                models.push({ id: m.id, name: m.name || m.id, providerId: p.id, providerName: p.name });
+            }
+        }
+        res.json(models);
+    });
+
+    // Workspace config
+    server.get('/api/workspace-config', (req, res) => {
+        res.json({ workspacesDir, defaultDir: defaultWorkspacesDir });
+    });
+    server.post('/api/workspace-config', (req, res) => {
+        const { dir } = req.body;
+        if (!dir) return res.status(400).json({ error: 'Missing dir' });
+        try {
+            const settingsPath = path.join(userDataPath, 'workspace-config.json');
+            fs.writeFileSync(settingsPath, JSON.stringify({ workspacesDir: dir }));
+            res.json({ ok: true, dir });
+        } catch (err) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
     // ===== Skills =====
     // Paths
     const bundledSkillsDir = path.join(__dirname, 'skills');
@@ -883,12 +1366,12 @@ function initServer(mainWindow) {
         const allExamples = [];
         for (const s of bundled) {
             seenNames.add(s.name);
-            allExamples.push({ ...s, enabled: prefs[s.id] !== undefined ? prefs[s.id] : false });
+            allExamples.push({ ...s, enabled: prefs[s.id] !== undefined ? prefs[s.id] : true });
         }
         for (const s of local) {
             if (seenNames.has(s.name)) continue;
             seenNames.add(s.name);
-            allExamples.push({ ...s, enabled: prefs[s.id] !== undefined ? prefs[s.id] : false });
+            allExamples.push({ ...s, enabled: prefs[s.id] !== undefined ? prefs[s.id] : true });
         }
 
         // 3) User-created skills
@@ -920,7 +1403,7 @@ function initServer(mainWindow) {
         const allExamples = [...bundled, ...local];
         const example = allExamples.find(s => s.id === id);
         if (example) {
-            return res.json({ ...example, enabled: prefs[id] !== undefined ? prefs[id] : false });
+            return res.json({ ...example, enabled: prefs[id] !== undefined ? prefs[id] : true });
         }
 
         // Check user skills
@@ -1050,6 +1533,164 @@ You have the following skills available. When a user's request matches a skill's
         console.log(`[Skills] ${enabled.length} skill(s) indexed in system prompt`);
         return block;
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  GITHUB CONNECTOR — OAuth + API
+    // ═══════════════════════════════════════════════════════════════
+
+    // GitHub OAuth App credentials (register at https://github.com/settings/developers)
+    // Callback URL must be: http://127.0.0.1:30080/api/github/callback
+    const GITHUB_CLIENT_ID = 'Ov23liWiTL6v74GsI2U7';
+    const GITHUB_CLIENT_SECRET = 'c3ee401a631d77a4ceebe33e68765d02ddccc36c';
+    const GITHUB_REDIRECT_URI = 'http://127.0.0.1:30080/api/github/callback';
+
+    // Persistent storage for GitHub token
+    const githubTokenPath = path.join(userDataPath, 'github-token.json');
+    function loadGithubToken() {
+        try {
+            if (fs.existsSync(githubTokenPath)) return JSON.parse(fs.readFileSync(githubTokenPath, 'utf8'));
+        } catch (_) {}
+        return null;
+    }
+    function saveGithubToken(data) {
+        fs.writeFileSync(githubTokenPath, JSON.stringify(data, null, 2));
+    }
+    function clearGithubToken() {
+        try { fs.unlinkSync(githubTokenPath); } catch (_) {}
+    }
+
+    // GET /api/github/status — check connection status
+    server.get('/api/github/status', async (req, res) => {
+        const token = loadGithubToken();
+        if (!token || !token.access_token) return res.json({ connected: false });
+        // Return cached user info without verifying every time (saves API calls)
+        if (token.login) {
+            return res.json({ connected: true, user: { login: token.login, avatar_url: token.avatar_url, name: token.name } });
+        }
+        res.json({ connected: false });
+    });
+
+    // GET /api/github/auth-url — return OAuth authorize URL
+    server.get('/api/github/auth-url', (req, res) => {
+        const state = require('crypto').randomBytes(16).toString('hex');
+        const url = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&redirect_uri=${encodeURIComponent(GITHUB_REDIRECT_URI)}&scope=repo,read:user&state=${state}`;
+        res.json({ url, state });
+    });
+
+    // GET /api/github/callback — OAuth callback, exchange code for token
+    server.get('/api/github/callback', async (req, res) => {
+        const { code } = req.query;
+        if (!code) return res.status(400).send('Missing code');
+        try {
+            // Use https module for better compatibility (avoids fetch issues in some Electron/Node environments)
+            const tokenData = await new Promise((resolve, reject) => {
+                const postData = JSON.stringify({ client_id: GITHUB_CLIENT_ID, client_secret: GITHUB_CLIENT_SECRET, code, redirect_uri: GITHUB_REDIRECT_URI });
+                const https = require('https');
+                const tokenReq = https.request({
+                    hostname: 'github.com', path: '/login/oauth/access_token', method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Content-Length': Buffer.byteLength(postData), 'User-Agent': 'ClaudeDesktop' }
+                }, (tokenRes) => {
+                    let body = '';
+                    tokenRes.on('data', c => body += c);
+                    tokenRes.on('end', () => { try { resolve(JSON.parse(body)); } catch (e) { reject(new Error('Invalid JSON: ' + body.slice(0, 200))); } });
+                });
+                tokenReq.on('error', reject);
+                tokenReq.write(postData);
+                tokenReq.end();
+            });
+
+            if (tokenData.access_token) {
+                // Fetch user info
+                const user = await new Promise((resolve) => {
+                    const https = require('https');
+                    const userReq = https.request({
+                        hostname: 'api.github.com', path: '/user', method: 'GET',
+                        headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'User-Agent': 'ClaudeDesktop' }
+                    }, (userRes) => {
+                        let body = '';
+                        userRes.on('data', c => body += c);
+                        userRes.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve({}); } });
+                    });
+                    userReq.on('error', () => resolve({}));
+                    userReq.end();
+                });
+                saveGithubToken({ access_token: tokenData.access_token, login: user.login, avatar_url: user.avatar_url, name: user.name });
+                console.log('[GitHub] Connected as', user.login);
+                res.send(`<!DOCTYPE html><html><head><title>Connected</title><style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#1a1a1a;color:#fff}div{text-align:center}h2{margin-bottom:8px}</style></head><body><div><h2>GitHub Connected!</h2><p>You can close this window.</p><script>setTimeout(()=>window.close(),1500)</script></div></body></html>`);
+            } else {
+                console.error('[GitHub] Token error:', tokenData);
+                res.status(400).send(`OAuth error: ${tokenData.error_description || tokenData.error || 'Unknown error'}`);
+            }
+        } catch (e) {
+            console.error('[GitHub] Callback error:', e);
+            res.status(500).send(`Error: ${e.message}`);
+        }
+    });
+
+    // POST /api/github/disconnect — remove saved token
+    server.post('/api/github/disconnect', (req, res) => {
+        clearGithubToken();
+        res.json({ ok: true });
+    });
+
+    // Helper: make GitHub API request using https module
+    function githubApiRequest(path, token) {
+        return new Promise((resolve, reject) => {
+            const https = require('https');
+            const req = https.request({
+                hostname: 'api.github.com', path, method: 'GET',
+                headers: { 'Authorization': `Bearer ${token}`, 'User-Agent': 'ClaudeDesktop' }
+            }, (resp) => {
+                let body = '';
+                resp.on('data', c => body += c);
+                resp.on('end', () => {
+                    try { resolve({ status: resp.statusCode, data: JSON.parse(body) }); }
+                    catch { reject(new Error('Invalid JSON')); }
+                });
+            });
+            req.on('error', reject);
+            req.end();
+        });
+    }
+
+    // GET /api/github/repos — list user repos
+    server.get('/api/github/repos', async (req, res) => {
+        const token = loadGithubToken();
+        if (!token?.access_token) return res.status(401).json({ error: 'Not connected' });
+        try {
+            const page = req.query.page || 1;
+            const { status, data } = await githubApiRequest(`/user/repos?sort=updated&per_page=30&page=${page}`, token.access_token);
+            if (status !== 200) return res.status(status).json({ error: 'GitHub API error' });
+            res.json(data.map(r => ({ id: r.id, name: r.name, full_name: r.full_name, description: r.description, private: r.private, html_url: r.html_url, language: r.language, updated_at: r.updated_at })));
+        } catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    // GET /api/github/repos/:owner/:repo/contents — browse repo contents
+    server.get('/api/github/repos/:owner/:repo/contents', async (req, res) => {
+        const token = loadGithubToken();
+        if (!token?.access_token) return res.status(401).json({ error: 'Not connected' });
+        try {
+            const filePath = req.query.path || '';
+            const ref = req.query.ref || '';
+            let apiPath = `/repos/${req.params.owner}/${req.params.repo}/contents/${filePath}`;
+            if (ref) apiPath += `?ref=${encodeURIComponent(ref)}`;
+            const { status, data } = await githubApiRequest(apiPath, token.access_token);
+            if (status !== 200) return res.status(status).json({ error: 'GitHub API error' });
+            res.json(data);
+        } catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    // GET /api/github/search — search code across repos
+    server.get('/api/github/search', async (req, res) => {
+        const token = loadGithubToken();
+        if (!token?.access_token) return res.status(401).json({ error: 'Not connected' });
+        try {
+            const q = encodeURIComponent(req.query.q || '');
+            const { status, data } = await githubApiRequest(`/search/code?q=${q}&per_page=20`, token.access_token);
+            if (status !== 200) return res.status(status).json({ error: 'GitHub API error' });
+            res.json(data);
+        } catch (e) { res.status(500).json({ error: e.message }); }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  CHAT ENDPOINT — Claude Code Engine via Bun CLI subprocess
@@ -1218,7 +1859,7 @@ You have the following skills available. When a user's request matches a skill's
 
 
     server.post('/api/chat', async (req, res) => {
-        const { conversation_id, message, attachments, env_token, env_base_url } = req.body;
+        const { conversation_id, message, attachments, env_token, env_base_url, user_mode, user_profile } = req.body;
         const conv = db.conversations.find(c => c.id === conversation_id);
         if (!conv) return res.status(404).json({ error: 'Conversation not found' });
 
@@ -1304,7 +1945,18 @@ You have the following skills available. When a user's request matches a skill's
             saveDb();
 
             // ── 3. Build system prompt ──
-            let sysPrompt = customSystemPrompt || '';
+            // Self-hosted users don't need anti-Kiro identity override (their providers are clean)
+            let sysPrompt = (user_mode === 'selfhosted' ? customSystemPromptClean : customSystemPromptFull) || '';
+
+            // Inject user profile preferences
+            if (user_profile) {
+                const parts = [];
+                if (user_profile.work_function) parts.push('Occupation: ' + user_profile.work_function);
+                if (user_profile.personal_preferences) parts.push('User preferences: ' + user_profile.personal_preferences);
+                if (parts.length > 0) {
+                    sysPrompt += '\n\n<user_profile>\n' + parts.join('\n') + '\n</user_profile>';
+                }
+            }
             if (conv.project_id) {
                 const project = db.projects.find(p => p.id === conv.project_id);
                 if (project) {
@@ -1327,17 +1979,30 @@ You have the following skills available. When a user's request matches a skill's
             }
 
             // ── 4. Determine mode: images → direct API, text → Claude Code engine ──
-            // Engine .env is authoritative for base URL; frontend may have stale value
-            const apiKey = env_token || engineEnvVars.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
-            const baseUrl = engineEnvVars.ANTHROPIC_BASE_URL || env_base_url || process.env.ANTHROPIC_BASE_URL;
-            console.log('[Chat] Key source:', env_token ? 'user(' + env_token.slice(0, 8) + '...)' : engineEnvVars.ANTHROPIC_API_KEY ? 'engine-env' : process.env.ANTHROPIC_API_KEY ? 'process-env' : 'NONE', '| baseUrl:', baseUrl);
             const rawModel = conv.model || 'claude-sonnet-4-6';
             const modelId = rawModel.replace(/-thinking$/, '');
+
+            // Try provider system only for self-hosted users
+            const provider = user_mode === 'selfhosted' ? resolveProvider(modelId) : null;
+            let apiKey, baseUrl, apiFormat = 'anthropic';
+            if (provider) {
+                apiKey = provider.apiKey;
+                baseUrl = provider.baseUrl;
+                apiFormat = provider.format || 'anthropic';
+                console.log('[Chat] Provider:', provider.name, '| format:', apiFormat, '| model:', modelId);
+            } else {
+                // Fallback: frontend token → engine env → process env (Clawparrot path)
+                const validToken = (env_token && env_token !== 'self-hosted') ? env_token : '';
+                apiKey = validToken || engineEnvVars.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+                baseUrl = validToken ? (env_base_url || engineEnvVars.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL) : (engineEnvVars.ANTHROPIC_BASE_URL || env_base_url || process.env.ANTHROPIC_BASE_URL);
+                console.log('[Chat] Key source:', validToken ? 'user' : engineEnvVars.ANTHROPIC_API_KEY ? 'engine-env' : 'process-env', '| baseUrl:', baseUrl);
+            }
 
             // ── 4a. IMAGE MODE: Vision via Bun subprocess (Node.js in Electron can't connect) ──
             if (hasImages) {
                 console.log('[Chat] Image detected, using Bun vision helper');
-                const endpoint = baseUrl ? (baseUrl.replace(/\/+$/, '').endsWith('/v1') ? baseUrl.replace(/\/+$/, '') + '/messages' : baseUrl.replace(/\/+$/, '') + '/v1/messages') : 'https://api.anthropic.com/v1/messages';
+                const cleanBase = baseUrl ? normalizeBaseUrl(baseUrl) : null;
+                const endpoint = cleanBase ? (cleanBase.endsWith('/v1') ? `${cleanBase}/messages` : `${cleanBase}/v1/messages`) : 'https://api.anthropic.com/v1/messages';
                 const userContent = [...imageBlocks, { type: 'text', text: message }];
                 const apiBody = { model: modelId, system: sysPrompt || undefined, messages: [{ role: 'user', content: userContent }], max_tokens: 8192, stream: true };
 
@@ -1392,7 +2057,7 @@ You have the following skills available. When a user's request matches a skill's
                 if (assistantText) {
                     db.messages.push({ id: uuidv4(), conversation_id, role: 'assistant', content: JSON.stringify([{ type: 'text', text: assistantText }]), created_at: new Date().toISOString() });
                     saveDb();
-                    generateTitleAsync(conversation_id, message.slice(0, 300), assistantText.slice(0, 300), apiKey, baseUrl, conv.model);
+                    generateTitleAsync(conversation_id, message.slice(0, 300), assistantText.slice(0, 300), apiKey, baseUrl, conv.model, apiFormat);
                 }
                 sendSSE({ type: 'message_stop' });
                 endStream(conversation_id);
@@ -1415,8 +2080,16 @@ You have the following skills available. When a user's request matches a skill's
             if (sysPrompt) cliArgs.push('--append-system-prompt', sysPrompt);
 
             const envVars = Object.assign({}, process.env);
-            if (apiKey) envVars.ANTHROPIC_API_KEY = apiKey;
-            if (baseUrl) envVars.ANTHROPIC_BASE_URL = baseUrl;
+            if (apiFormat === 'openai' && proxyPort > 0) {
+                // OpenAI provider: route engine through local conversion proxy
+                proxyTarget = { apiKey, baseUrl, model: modelId, format: 'openai' };
+                envVars.ANTHROPIC_API_KEY = 'proxy-key'; // engine needs a non-empty key
+                envVars.ANTHROPIC_BASE_URL = 'http://127.0.0.1:' + proxyPort + '/v1';
+                console.log('[Engine] Routing through OpenAI proxy, model=' + modelId + ' provider=' + (provider ? provider.name : '?'));
+            } else {
+                if (apiKey) envVars.ANTHROPIC_API_KEY = apiKey;
+                if (baseUrl) envVars.ANTHROPIC_BASE_URL = normalizeBaseUrl(baseUrl);
+            }
 
             const bunExe = bunExePath;
 
@@ -1443,6 +2116,16 @@ You have the following skills available. When a user's request matches a skill's
 
             // Tools that are internal to Claude Code and should not be shown to the user
             const HIDDEN_TOOLS = new Set(['EnterWorktree', 'ExitWorktree', 'TodoWrite', 'WebSearch', 'WebFetch']);
+
+            // Ensure tool_use_start is sent before tool_use_done — if the 'assistant' event was
+            // missing or arrived out of order, we back-fill it from the toolCalls map
+            function ensureToolStartSent(toolUseId) {
+                if (sentToolStarts.has(toolUseId)) return;
+                var tc = toolCalls.get(toolUseId);
+                if (!tc || HIDDEN_TOOLS.has(tc.name)) return;
+                sentToolStarts.add(toolUseId);
+                sendSSE({ type: 'tool_use_start', tool_use_id: tc.id, tool_name: tc.name, tool_input: tc.input || {} });
+            }
 
             child.stdout.on('data', (chunk) => {
                 buf += chunk.toString('utf8');
@@ -1556,6 +2239,7 @@ You have the following skills available. When a user's request matches a skill's
 
                                 // Don't send tool_use_done for hidden tools
                                 if (!HIDDEN_TOOLS.has(tn)) {
+                                    ensureToolStartSent(cb.tool_use_id);
                                     sendSSE({ type: 'tool_use_done', tool_use_id: cb.tool_use_id, content: trText.slice(0, 50000), is_error: cb.is_error || false });
                                 }
                             }
@@ -1596,6 +2280,7 @@ You have the following skills available. When a user's request matches a skill's
 
                         // Don't send results for hidden/internal tools
                         if (!HIDDEN_TOOLS.has(toolName)) {
+                            ensureToolStartSent(evt.tool_use_id);
                             sendSSE({ type: 'tool_use_done', tool_use_id: evt.tool_use_id, content: resultText.slice(0, 50000), is_error: evt.is_error || false });
                         }
                     }
@@ -1667,7 +2352,7 @@ You have the following skills available. When a user's request matches a skill's
                     searchLogs: searchLogs.length > 0 ? searchLogs : undefined,
                 });
                 saveDb();
-                generateTitleAsync(conversation_id, message.slice(0, 300), assistantText.slice(0, 300), apiKey, baseUrl, conv.model);
+                generateTitleAsync(conversation_id, message.slice(0, 300), assistantText.slice(0, 300), apiKey, baseUrl, conv.model, apiFormat);
             }
 
             sendSSE({ type: 'message_stop' });

@@ -10,7 +10,7 @@ interface ArtifactsPanelProps {
 
 const ArtifactsPanel: React.FC<ArtifactsPanelProps> = ({ documents, onClose, onOpenDocument }) => {
     return (
-        <div className="h-full flex flex-col bg-claude-bg">
+        <div className="h-full w-full flex flex-col bg-transparent">
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-4 flex-shrink-0">
                 <h2 className="text-[16px] font-semibold text-claude-text">Artifacts</h2>

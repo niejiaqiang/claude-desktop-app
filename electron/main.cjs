@@ -89,11 +89,11 @@ function createWindow() {
     if (isDev) {
         // In development, load from Vite dev server
         mainWindow.loadURL('http://localhost:3000');
-        // mainWindow.webContents.openDevTools(); // Uncomment for debugging
     } else {
         // In production, load the built files
         mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
     }
+    // mainWindow.webContents.openDevTools();
 
     // Open all external links in the system browser, not in the app
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -161,20 +161,13 @@ app.whenReady().then(() => {
             if (mainWindow) {
                 mainWindow.webContents.send('update-status', { type: 'downloaded', version: info.version });
             }
-            // Show dialog
-            dialog.showMessageBox(mainWindow, {
-                type: 'info',
-                title: '更新就绪',
-                message: `新版本 ${info.version} 已下载完成，重启应用即可更新。`,
-                buttons: ['立即重启', '稍后'],
-                defaultId: 0,
-            }).then(({ response }) => {
-                if (response === 0) autoUpdater.quitAndInstall();
-            });
         });
 
         autoUpdater.on('error', (err) => {
             console.log('[Update] Error:', err.message);
+            if (mainWindow) {
+                mainWindow.webContents.send('update-status', { type: 'error', message: err.message });
+            }
         });
 
         // Check for updates after 5 seconds, then every 30 minutes
@@ -199,6 +192,14 @@ app.on('window-all-closed', () => {
 // IPC Handlers for future bridge communication
 ipcMain.handle('get-app-path', () => app.getPath('userData'));
 ipcMain.handle('get-platform', () => process.platform);
+ipcMain.handle('install-update', () => { autoUpdater.quitAndInstall(); });
+ipcMain.handle('open-external', (_, url) => { const { shell } = require('electron'); shell.openExternal(url); });
+ipcMain.handle('resize-window', (_, width, height) => {
+    if (mainWindow) {
+        mainWindow.setSize(width, height);
+        mainWindow.center();
+    }
+});
 
 // Open the folder containing the given file path in system explorer
 // Returns true if opened, false if file/folder not found

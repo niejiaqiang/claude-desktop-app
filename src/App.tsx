@@ -6,10 +6,12 @@ import MainContent from './components/MainContent';
 import { IconSidebarToggle } from './components/Icons';
 import { updateConversation, deleteConversation, exportConversation, getUnreadAnnouncements, markAnnouncementRead } from './api';
 import Auth from './components/Auth';
+import Onboarding from './components/Onboarding';
 import SettingsPage from './components/SettingsPage';
 import UpgradePlan from './components/UpgradePlan';
 import DocumentPanel from './components/DocumentPanel';
 import ArtifactsPanel from './components/ArtifactsPanel';
+import ArtifactsPage from './components/ArtifactsPage';
 import DraggableDivider from './components/DraggableDivider';
 import { DocumentInfo } from './components/DocumentCard';
 import AdminLayout from './components/admin/AdminLayout';
@@ -243,6 +245,7 @@ const Layout = () => {
   const [authValid, setAuthValid] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showUpgrade, setShowUpgrade] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(() => !localStorage.getItem('onboarding_done'));
 
   // Document panel state
   const [documentPanelDoc, setDocumentPanelDoc] = useState<DocumentInfo | null>(null);
@@ -253,6 +256,15 @@ const Layout = () => {
   const [currentChatTitle, setCurrentChatTitle] = useState('');
   const sidebarWasCollapsedRef = useRef(false);
   const contentContainerRef = useRef<HTMLDivElement>(null);
+
+  // Detect macOS for traffic light padding
+  const [isMac, setIsMac] = useState(false);
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (api?.getPlatform) {
+      api.getPlatform().then((p: string) => setIsMac(p === 'darwin'));
+    }
+  }, []);
 
   // Title bar height adjusts inversely to zoom so it stays visually constant
   const [titleBarHeight, setTitleBarHeight] = useState(44);
@@ -289,10 +301,16 @@ const Layout = () => {
   const isElectron = !!(window as any).electronAPI?.isElectron;
   useEffect(() => {
     if (isElectron) {
-      // Electron: check if gateway API key exists
-      const hasKey = localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user');
-      if (!hasKey) {
-        setAuthValid(false);
+      const userMode = localStorage.getItem('user_mode');
+      if (userMode === 'selfhosted') {
+        // Self-hosted: always valid, user provides their own key
+        setAuthValid(true);
+      } else {
+        // Clawparrot: check if gateway API key exists
+        const hasKey = localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user');
+        if (!hasKey) {
+          setAuthValid(false);
+        }
       }
     }
   }, [isElectron]);
@@ -453,6 +471,21 @@ const Layout = () => {
     toggleAbsLeft: 8, // Collapsed State Left Position
   });
 
+  // Onboarding: show on first launch
+  if (showOnboarding) {
+    return <Onboarding onComplete={() => {
+      setShowOnboarding(false);
+      // Re-evaluate auth after onboarding
+      const userMode = localStorage.getItem('user_mode');
+      if (userMode === 'selfhosted') {
+        setAuthValid(true);
+      } else {
+        const hasKey = localStorage.getItem('ANTHROPIC_API_KEY') && localStorage.getItem('gateway_user');
+        setAuthValid(!!hasKey);
+      }
+    }} />;
+  }
+
   // Guard: check if logged in
   if (!authChecked) {
     return null; // 验证中，不渲染
@@ -469,10 +502,10 @@ const Layout = () => {
           className="absolute top-0 left-0 w-full z-50 flex items-center select-none pointer-events-none bg-claude-bg border-b border-claude-border transition-all duration-300"
           style={{ WebkitAppRegion: 'drag', height: `${titleBarHeight}px` } as React.CSSProperties}
         >
-          {/* Left Controls inside Title Bar */}
+          {/* Left Controls inside Title Bar — extra padding on Mac for traffic lights */}
           <div
-            className="h-full flex items-center pl-1 pr-2 gap-0.5"
-            style={{ pointerEvents: 'auto', WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+            className="h-full flex items-center pr-2 gap-0.5"
+            style={{ pointerEvents: 'auto', WebkitAppRegion: 'no-drag', paddingLeft: isMac ? '78px' : '4px' } as React.CSSProperties}
           >
             <button
               onClick={() => { }}
@@ -522,7 +555,7 @@ const Layout = () => {
             {/* Main Content Area - takes remaining width after panel */}
             <div className="flex-1 flex flex-col h-full min-w-0">
               {/* Header - Only render here if NOT in Artifacts-only mode */}
-              {isChatMode && (!showArtifacts || documentPanelDoc) && !showSettings && !showUpgrade && location.pathname !== '/chats' && location.pathname !== '/customize' && location.pathname !== '/projects' && (
+              {isChatMode && (!showArtifacts || documentPanelDoc) && !showSettings && !showUpgrade && location.pathname !== '/chats' && location.pathname !== '/customize' && location.pathname !== '/projects' && location.pathname !== '/artifacts' && (
                 <ChatHeader
                   title={currentChatTitle}
                   showArtifacts={showArtifacts}
@@ -543,6 +576,17 @@ const Layout = () => {
                 <CustomizePage />
               ) : location.pathname === '/projects' ? (
                 <ProjectsPage />
+              ) : location.pathname === '/artifacts' ? (
+                <ArtifactsPage onTryPrompt={(prompt) => {
+                  if (prompt === '__remix__') {
+                    // Remix mode: artifact data already in sessionStorage
+                    sessionStorage.setItem('artifact_prompt', '__remix__');
+                  } else {
+                    sessionStorage.setItem('artifact_prompt', prompt);
+                  }
+                  handleNewChat();
+                  window.location.hash = '#/';
+                }} />
               ) : (
                 <MainContent
                   onNewChat={refreshSidebar}
@@ -559,11 +603,11 @@ const Layout = () => {
 
             {/* Animated Document Panel Container */}
             <div
-              className={`h-full bg-claude-bg transition-all duration-300 ease-out flex z-20 relative ${showArtifacts ? 'border border-claude-border rounded-2xl mr-2 ml-4' : ''}`}
+              className={`h-full bg-claude-bg transition-all duration-300 ease-out flex z-20 relative ${(documentPanelDoc || showArtifacts) ? 'border-l border-claude-border' : ''}`}
               style={{
-                width: documentPanelDoc ? `${documentPanelWidth}%` : showArtifacts ? '420px' : '0px',
+                width: documentPanelDoc ? `${documentPanelWidth}%` : showArtifacts ? '360px' : '0px',
                 opacity: (documentPanelDoc || showArtifacts) ? 1 : 0,
-                overflow: showArtifacts ? 'hidden' : 'visible'
+                overflow: 'hidden'
               }}
             >
               {documentPanelDoc && (
@@ -650,6 +694,7 @@ const App = () => {
         <Route path="/chats" element={<Layout />} />
         <Route path="/customize" element={<Layout />} />
         <Route path="/projects" element={<Layout />} />
+        <Route path="/artifacts" element={<Layout />} />
         <Route path="/chat/:id" element={<Layout />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

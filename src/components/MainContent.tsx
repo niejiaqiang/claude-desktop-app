@@ -3,7 +3,7 @@ import { ChevronDown, FileText, ArrowUp, RotateCcw, Pencil, Copy, Check, Papercl
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { IconPlus, IconVoice, IconPencil } from './Icons';
 import ClaudeLogo from './ClaudeLogo';
-import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, uploadFile, deleteAttachment, compactConversation, answerUserQuestion, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration, getContextSize, getUserModels, getStreamStatus, reconnectStream } from '../api';
+import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, uploadFile, deleteAttachment, compactConversation, answerUserQuestion, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration, getContextSize, getUserModels, getStreamStatus, reconnectStream, getProviderModels } from '../api';
 import { addStreaming, removeStreaming, isStreaming } from '../streamingState';
 import MarkdownRenderer from './MarkdownRenderer';
 import ModelSelector, { SelectableModel } from './ModelSelector';
@@ -659,11 +659,11 @@ const MessageList = React.memo<MessageListProps>(({
                       <span className={`text-[14px] ${!allDone ? 'animate-shimmer-text' : 'text-claude-textSecondary'}`}>
                         {summary}
                       </span>
-                      <ChevronDown size={14} className={`transform transition-transform duration-200 ${msg.isToolCallsExpanded ? 'rotate-180' : ''}`} />
+                      <ChevronDown size={14} className={`transform transition-transform duration-200 ${(msg.isToolCallsExpanded ?? !allDone) ? 'rotate-180' : ''}`} />
                     </div>
                     </div>
 
-                    {msg.isToolCallsExpanded && (
+                    {(msg.isToolCallsExpanded ?? !allDone) && (
                       <div className="mt-2 ml-1 pl-4 border-l-2 border-claude-border space-y-3">
                         {visibleToolCalls.map((tc: any, tcIdx: number) => {
                           const inputStr = tc.input ? (typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input, null, 2)) : '';
@@ -682,7 +682,7 @@ const MessageList = React.memo<MessageListProps>(({
                                     prev.map((m, i) => {
                                       if (i !== idx) return m;
                                       const newTc = [...m.toolCalls];
-                                      newTc[tcIdx] = { ...newTc[tcIdx], isExpanded: newTc[tcIdx].isExpanded === undefined ? false : !newTc[tcIdx].isExpanded };
+                                      newTc[tcIdx] = { ...newTc[tcIdx], isExpanded: newTc[tcIdx].isExpanded === undefined ? true : !newTc[tcIdx].isExpanded };
                                       return { ...m, toolCalls: newTc };
                                     })
                                   );
@@ -708,12 +708,12 @@ const MessageList = React.memo<MessageListProps>(({
                                   )}
                                   {realStatus === 'running' && <span className="text-claude-textSecondary text-[12px] animate-shimmer-text">Running...</span>}
                                   {realStatus === 'error' && <span className="text-red-400/80 text-[12px]">Failed</span>}
-                                  {realStatus !== 'running' && expandable && (
+                                  {expandable && (
                                     <ChevronDown size={14} className={`text-claude-textSecondary transform transition-transform duration-200 ${(tc.isExpanded ?? false) ? 'rotate-180' : ''}`} />
                                   )}
                                 </div>
                               </div>
-                              {expandable && realStatus !== 'running' && (tc.isExpanded ?? false) && (
+                              {expandable && (tc.isExpanded ?? false) && (
                                 <div className="px-2 py-2 border-t border-black/5 dark:border-white/5">
                                   {shouldUseDiffView(tc.name, tc.input) ? (
                                     <ToolDiffView toolName={tc.name} input={tc.input} result={tc.result} />
@@ -755,7 +755,7 @@ const MessageList = React.memo<MessageListProps>(({
                 <DocumentCreationProcess drafts={normalizeDocumentDrafts(msg)} />
               )}
 
-              <MarkdownRenderer content={msg.content} citations={msg.citations} />
+              <MarkdownRenderer content={extractTextContent(msg.content)} citations={msg.citations} />
               {normalizeMessageDocuments(msg).length > 0 && (
                 <div className="mt-2 mb-1 space-y-2">
                   {normalizeMessageDocuments(msg).map((doc, docIdx) => (
@@ -849,24 +849,28 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   // Model state
   const [modelCatalog, setModelCatalog] = useState<ModelCatalog | null>(null);
+  const isSelfHostedMode = localStorage.getItem('user_mode') === 'selfhosted';
   const fallbackCommonModels = useMemo<SelectableModel[]>(() => ([
-    { id: 'claude-opus-4-6', name: 'Opus 4.6', enabled: 1 },
-    { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6', enabled: 1 },
-    { id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5', enabled: 1 },
+    { id: 'claude-opus-4-6', name: 'Opus 4.6', enabled: 1, description: 'Most capable for ambitious work' },
+    { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6', enabled: 1, description: 'Most efficient for everyday tasks' },
+    { id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5', enabled: 1, description: 'Fastest for quick answers' },
   ]), []);
   const displayCommonModels = modelCatalog?.common?.length ? modelCatalog.common : fallbackCommonModels;
   const selectorModels = useMemo<SelectableModel[]>(() => {
     const visible = [...displayCommonModels];
-    const seen = new Set(visible.map(m => m.id));
-    const gptModels = (modelCatalog?.all || []).filter(m => /^gpt-/i.test(m.id));
-    for (const model of gptModels) {
-      if (seen.has(model.id)) continue;
-      visible.push(model);
-      seen.add(model.id);
+    // Only add extra models (e.g. GPT) for self-hosted mode
+    if (isSelfHostedMode) {
+      const seen = new Set(visible.map(m => m.id));
+      const extraModels = (modelCatalog?.all || []).filter(m => !seen.has(m.id));
+      for (const model of extraModels) {
+        // Tag non-tier models as 'extra' so ModelSelector can split them into "More models"
+        visible.push({ ...model, tier: model.tier || 'extra' });
+        seen.add(model.id);
+      }
     }
     return visible;
-  }, [displayCommonModels, modelCatalog]);
-  const [currentModelString, setCurrentModelString] = useState(localStorage.getItem('default_model') || 'claude-sonnet-4-5-20250929-thinking');
+  }, [displayCommonModels, modelCatalog, isSelfHostedMode]);
+  const [currentModelString, setCurrentModelString] = useState(localStorage.getItem('default_model') || 'claude-sonnet-4-6');
   const [conversationTitle, setConversationTitle] = useState("");
 
   useEffect(() => {
@@ -900,6 +904,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const textareaHeightVal = useRef(inputBarBaseHeight);
 
   const isCreatingRef = useRef(false);
+  const pendingInitialMessageRef = useRef<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const activeRequestCountRef = useRef(0);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -933,7 +938,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   }, [modelCatalog, displayCommonModels]);
 
   const resolveModelForNewChat = useCallback((preferredModel?: string | null) => {
-    const saved = preferredModel || localStorage.getItem('default_model') || 'claude-sonnet-4-5-20250929-thinking';
+    const saved = preferredModel || localStorage.getItem('default_model') || 'claude-sonnet-4-6';
     const thinking = isThinkingModel(saved);
     const base = stripThinking(saved);
     const all = modelCatalog?.all || displayCommonModels;
@@ -946,7 +951,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       || all.find(m => /sonnet/i.test(m.id) && Number(m.enabled) === 1)?.id
       || all.find(m => Number(m.enabled) === 1)?.id
       || base
-      || 'claude-sonnet-4-5-20250929';
+      || 'claude-sonnet-4-6';
     return withThinking(fallbackBase, thinking);
   }, [displayCommonModels, modelCatalog]);
 
@@ -1088,19 +1093,103 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       setShowEntranceAnimation(true);
       setTimeout(() => setShowEntranceAnimation(false), 800);
       isAtBottomRef.current = true;
+
+      // Check for artifact prompt (from Artifacts page)
+      const artifactPrompt = sessionStorage.getItem('artifact_prompt');
+      if (artifactPrompt) {
+        sessionStorage.removeItem('artifact_prompt');
+        if (artifactPrompt === '__remix__') {
+          // Remix mode: pre-load artifact into conversation
+          const remixData = sessionStorage.getItem('artifact_remix');
+          sessionStorage.removeItem('artifact_remix');
+          if (remixData) {
+            try {
+              const remix = JSON.parse(remixData);
+              // Inject pre-baked assistant message with artifact info
+              const assistantMsg = {
+                id: 'remix-' + Date.now(),
+                role: 'assistant' as const,
+                content: JSON.stringify([{ type: 'text', text: `I'll customize this artifact:\n\n**${remix.name}**\n\nTransform any artifact into something uniquely yours by customizing its core elements.\n\n1. Change the topic - Adapt the content for a different subject\n2. Update the style - Refresh the visuals or overall design\n3. Make it personal - Tailor specifically for your needs\n4. Share your vision - I'll bring it to life\n\nWhere would you like to begin?` }]),
+                created_at: new Date().toISOString(),
+              };
+              setTimeout(() => {
+                setMessages([assistantMsg]);
+                // Open the artifact in DocumentPanel
+                if (remix.code?.content && onOpenDocument) {
+                  const isReactArtifact = remix.code?.type === 'application/vnd.ant.react';
+                  onOpenDocument({
+                    id: 'remix-artifact',
+                    title: remix.code?.title || remix.name,
+                    filename: (remix.code?.title || remix.name) + (isReactArtifact ? '.jsx' : '.html'),
+                    url: '',
+                    content: remix.code.content,
+                    format: isReactArtifact ? 'jsx' : 'html',
+                  });
+                }
+              }, 200);
+            } catch {}
+          }
+        } else {
+          // Normal artifact prompt: auto-send
+          setTimeout(() => handleSend(artifactPrompt), 300);
+        }
+      }
     }
   }, [resetKey, resolveModelForNewChat]);
 
   useEffect(() => {
     let cancelled = false;
+    const isSelfHosted = localStorage.getItem('user_mode') === 'selfhosted';
     const loadModels = async () => {
       try {
-        const data = await getUserModels();
+        let data: any;
+        if (isSelfHosted) {
+          // Self-hosted: use chat_models from localStorage (configured in Models settings)
+          let chatModels: any[] = [];
+          try { chatModels = JSON.parse(localStorage.getItem('chat_models') || '[]'); } catch {}
+          if (chatModels.length > 0) {
+            const tierDescMap: Record<string, string> = {
+              'opus': 'Most capable for ambitious work',
+              'sonnet': 'Most efficient for everyday tasks',
+              'haiku': 'Fastest for quick answers',
+            };
+            const all = chatModels.map((m: any) => ({
+              id: m.id,
+              name: m.name || m.id,
+              enabled: 1,
+              tier: m.tier || 'extra',
+              description: m.tier && tierDescMap[m.tier] ? tierDescMap[m.tier] : undefined,
+            }));
+            // Common = tier models (opus/sonnet/haiku), ordered by tier
+            const tierOrder = ['opus', 'sonnet', 'haiku'];
+            const common = tierOrder.map(t => all.find((m: any) => m.tier === t)).filter(Boolean);
+            data = { all, common: common.length > 0 ? common : all, fallback_model: localStorage.getItem('default_model') || all[0]?.id || 'claude-sonnet-4-6' };
+          } else {
+            // Fallback: load all from providers
+            const pModels = await getProviderModels();
+            const all = pModels.map(m => ({ id: m.id, name: m.name || m.id, enabled: 1 }));
+            data = { all, common: all, fallback_model: all[0]?.id || 'claude-sonnet-4-6' };
+          }
+        } else {
+          data = await getUserModels();
+          // Enrich known Anthropic models with descriptions
+          const descMap: Record<string, string> = {
+            'claude-opus-4-6': 'Most capable for ambitious work',
+            'claude-sonnet-4-6': 'Most efficient for everyday tasks',
+            'claude-haiku-4-5-20251001': 'Fastest for quick answers',
+          };
+          for (const list of [data?.common, data?.all]) {
+            if (!Array.isArray(list)) continue;
+            for (const m of list) {
+              if (descMap[m.id] && !m.description) m.description = descMap[m.id];
+            }
+          }
+        }
         if (cancelled) return;
         setModelCatalog(data);
-        if (!activeId) {
+        if (!viewingIdRef.current) {
           setCurrentModelString(prev => {
-            const current = prev || localStorage.getItem('default_model') || 'claude-sonnet-4-5-20250929-thinking';
+            const current = prev || localStorage.getItem('default_model') || 'claude-sonnet-4-6';
             const thinking = isThinkingModel(current);
             const base = stripThinking(current);
             const all: SelectableModel[] = data?.all?.length ? data.all : fallbackCommonModels;
@@ -1110,7 +1199,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
               || all.find((m: SelectableModel) => /sonnet/i.test(m.id) && Number(m.enabled) === 1)?.id
               || all.find((m: SelectableModel) => Number(m.enabled) === 1)?.id
               || base
-              || 'claude-sonnet-4-5-20250929';
+              || 'claude-sonnet-4-6';
             return withThinking(fallbackBase, thinking);
           });
         }
@@ -1124,7 +1213,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       cancelled = true;
       clearInterval(timer);
     };
-  }, [activeId, fallbackCommonModels]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fallbackCommonModels]);
 
   // 草稿持久化：切换对话 / 打开设置页面时保存，切回时恢复
   const draftKey = activeId || '__new__';
@@ -1273,7 +1363,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   if (!lastMsg || lastMsg.role !== 'assistant') return prev;
                   const toolCalls = lastMsg.toolCalls || [];
                   if (toolEvent.type === 'start') toolCalls.push({ id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: toolEvent.tool_input, status: 'running' as const });
-                  else if (toolEvent.type === 'done') { const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id); if (tc) { tc.status = toolEvent.is_error ? 'error' as const : 'done' as const; tc.result = toolEvent.content; } }
+                  else if (toolEvent.type === 'done') {
+                    let tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+                    if (!tc) { tc = { id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: {}, status: 'done' as const, result: toolEvent.content }; toolCalls.push(tc); }
+                    else { tc.status = toolEvent.is_error ? 'error' as const : 'done' as const; tc.result = toolEvent.content; }
+                  }
                   lastMsg.toolCalls = toolCalls;
                   return newMsgs;
                 });
@@ -1285,6 +1379,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       }
       getContextSize(activeId).then(setContextInfo).catch(() => { });
       isAtBottomRef.current = true;
+
+      // Handle initialMessage from Project page navigation
+      const navState = location.state as any;
+      if (navState?.initialMessage) {
+        pendingInitialMessageRef.current = navState.initialMessage;
+        if (navState.model) setCurrentModelString(navState.model);
+        // Clear location state to prevent re-sends on refresh
+        navigate(location.pathname, { replace: true, state: {} });
+      }
       return;
     }
 
@@ -1430,6 +1533,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     stopPolling();
     try {
       const data = await getConversation(conversationId);
+      // Restore conversation model — always trust the server's stored model
+      if (data.model) {
+        setCurrentModelString(data.model);
+      }
       const normalizedMessages = (data.messages || []).map((msg: any) => {
         // Normalize attachment field names (bridge-server uses camelCase, component expects snake_case)
         if (msg.attachments && Array.isArray(msg.attachments)) {
@@ -1447,9 +1554,6 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       setMessages(normalizedMessages);
       isAtBottomRef.current = true;
       scheduleScrollToBottomAfterRender();
-      if (data.model) {
-        setCurrentModelString(data.model);
-      }
       setConversationTitle(data.title || 'New Chat');
 
       // 检查是否有活跃的后台生成
@@ -1574,11 +1678,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   };
 
-  const handleSend = async () => {
+  const handleSend = async (overrideText?: string) => {
+    const effectiveText = overrideText ?? inputText;
     const hasFiles = pendingFiles.some(f => f.status === 'done');
     const hasErrorFiles = pendingFiles.some(f => f.status === 'error');
-    if ((!inputText.trim() && !hasFiles) || loading) {
-      if (!loading && !inputText.trim() && !hasFiles && hasErrorFiles) {
+    if ((!effectiveText.trim() && !hasFiles) || loading) {
+      if (!loading && !effectiveText.trim() && !hasFiles && hasErrorFiles) {
         alert('有文件上传失败，请先删除失败文件后再发送');
       }
       return;
@@ -1593,7 +1698,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       return;
     }
 
-    const userMessageText = inputText;
+    const userMessageText = effectiveText;
     setInputText(""); // Clear input
 
     // 收集已上传的附件
@@ -2032,8 +2137,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
               status: 'running' as const,
             });
           } else if (toolEvent.type === 'done') {
-            const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
-            if (tc) {
+            let tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+            if (!tc) {
+              // tool_use_start was missed — back-fill the entry so the card still renders
+              tc = { id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: {}, status: 'done' as const, result: toolEvent.content };
+              toolCalls.push(tc);
+            } else {
               tc.status = toolEvent.is_error ? 'error' as const : 'done' as const;
               tc.result = toolEvent.content;
             }
@@ -2070,6 +2179,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       handleSend();
     }
   };
+
+  // Auto-send initialMessage from Project page navigation
+  useEffect(() => {
+    if (pendingInitialMessageRef.current && activeId && !loading) {
+      const msg = pendingInitialMessageRef.current;
+      pendingInitialMessageRef.current = null;
+      // Small delay to let conversation finish loading
+      setTimeout(() => handleSend(msg), 150);
+    }
+  }, [activeId, loading]);
 
   // 停止生成（双模式：SSE 直连 or 轮询模式）
   const handleStop = () => {

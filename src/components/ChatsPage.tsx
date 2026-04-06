@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getConversations, deleteConversation, updateConversation } from '../api';
+import { getConversations, deleteConversation, updateConversation, getProjects, Project } from '../api';
 import { Search, Plus, MoreHorizontal, Star, Pencil, Trash, X, Minus, Check } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { IconProjects } from './Icons';
@@ -25,7 +25,7 @@ const RenameModal = ({ isOpen, onClose, onSave, initialTitle }: { isOpen: boolea
 
   return createPortal(
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div 
+      <div
         className="bg-claude-input rounded-2xl shadow-xl w-[400px] p-6 animate-fade-in"
         onClick={e => e.stopPropagation()}
       >
@@ -78,12 +78,17 @@ const ChatsPage = () => {
   const [showRenameModal, setShowRenameModal] = useState(false);
   const [renameChatId, setRenameChatId] = useState<string | null>(null);
   const [renameInitialTitle, setRenameInitialTitle] = useState('');
-  
+
   // Selection Mode State
   const [isSelectionMode, setIsSelectionMode] = useState(false);
   const [selectedChatIds, setSelectedChatIds] = useState<Set<string>>(new Set());
 
+  // Add to project state
+  const [showProjectPicker, setShowProjectPicker] = useState(false);
+  const [projectList, setProjectList] = useState<Project[]>([]);
+
   const menuRef = useRef<HTMLDivElement>(null);
+  const projectPickerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     // Inject Spectral font for the title
@@ -91,7 +96,7 @@ const ChatsPage = () => {
     link.href = 'https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,300&display=swap';
     link.rel = 'stylesheet';
     document.head.appendChild(link);
-    
+
     fetchChats();
 
     const handleClickOutside = (event: MouseEvent) => {
@@ -198,7 +203,39 @@ const ChatsPage = () => {
     }
   };
 
-  const filteredChats = chats.filter(chat => 
+  const handleAddToProject = async () => {
+    if (selectedChatIds.size === 0) return;
+    try {
+      const projects = await getProjects();
+      if (projects.length === 0) {
+        alert('暂无项目，请先在 Projects 页面创建一个项目');
+        return;
+      }
+      setProjectList(projects);
+      setShowProjectPicker(true);
+    } catch (err) {
+      console.error('Failed to load projects:', err);
+    }
+  };
+
+  const handleMoveToProject = async (projectId: string) => {
+    try {
+      await Promise.all(
+        Array.from(selectedChatIds).map(id =>
+          updateConversation(id, { project_id: projectId })
+        )
+      );
+      // Remove moved chats from the list (they're now project chats)
+      setChats(prev => prev.filter(c => !selectedChatIds.has(c.id)));
+      setSelectedChatIds(new Set());
+      setIsSelectionMode(false);
+      setShowProjectPicker(false);
+    } catch (err) {
+      console.error('Failed to move chats to project:', err);
+    }
+  };
+
+  const filteredChats = chats.filter(chat =>
     (chat.title || 'New Chat').toLowerCase().includes(searchQuery.toLowerCase())
   );
 
@@ -207,7 +244,7 @@ const ChatsPage = () => {
     const date = new Date(dateStr);
     const now = new Date();
     const diffInSeconds = Math.floor((now.getTime() - date.getTime()) / 1000);
-    
+
     if (diffInSeconds < 60) return 'just now';
     if (diffInSeconds < 3600) return `${Math.floor(diffInSeconds / 60)} minutes ago`;
     if (diffInSeconds < 86400) return `${Math.floor(diffInSeconds / 3600)} hours ago`;
@@ -219,8 +256,8 @@ const ChatsPage = () => {
     <div className="flex-1 h-full bg-claude-bg overflow-y-auto">
       <div className="max-w-[800px] mx-auto px-4 py-8 md:px-8 md:py-12">
         <div className="flex items-center justify-between mb-8">
-          <h1 
-            className="font-[Spectral] text-[32px] text-claude-text" 
+          <h1
+            className="font-[Spectral] text-[32px] text-claude-text"
             style={{
               fontWeight: 500,
               WebkitTextStroke: '0.5px currentColor'
@@ -230,23 +267,24 @@ const ChatsPage = () => {
           </h1>
           <button
             onClick={() => navigate('/')}
-            className="flex items-center gap-2 px-4 py-2 bg-black text-white dark:bg-white dark:text-black rounded-lg hover:opacity-90 transition-opacity font-medium text-[14px]"
+            className="flex items-center gap-2 px-3.5 py-1.5 bg-claude-text text-claude-bg hover:opacity-90 rounded-lg transition-opacity font-medium"
+            style={{ fontSize: '14px' }}
           >
-            <Plus size={18} />
+            <Plus size={16} strokeWidth={2.5} />
             New chat
           </button>
         </div>
 
         <div className="relative mb-6">
           <div className="absolute inset-y-0 left-3 flex items-center pointer-events-none">
-            <Search className="h-5 w-5 text-gray-400" />
+            <Search className="h-5 w-5 text-claude-textSecondary opacity-80" />
           </div>
           <input
             type="text"
             placeholder="Search your chats..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-3 bg-white dark:bg-claude-input border border-gray-200 dark:border-claude-border rounded-xl text-claude-text focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all text-[15px]"
+            className="w-full pl-10 pr-4 py-3 bg-white dark:bg-claude-input border border-gray-200 dark:border-claude-border rounded-xl text-claude-text placeholder-claude-textSecondary focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all text-[15px]"
           />
         </div>
 
@@ -254,7 +292,7 @@ const ChatsPage = () => {
         {isSelectionMode ? (
           <div className="flex items-center justify-between mb-4 bg-transparent animate-fade-in h-8">
             <div className="flex items-center gap-4">
-              <button 
+              <button
                 onClick={handleSelectAll}
                 className="flex items-center justify-center w-5 h-5 rounded bg-blue-600 text-white hover:bg-blue-700 transition-colors"
               >
@@ -269,24 +307,43 @@ const ChatsPage = () => {
               <span className="text-[13px] text-claude-textSecondary">
                 {selectedChatIds.size} selected
               </span>
-              <div className="flex items-center gap-2 ml-2">
-                <button 
-                  className="p-1 text-claude-textSecondary hover:text-claude-text transition-colors" 
+              <div className="flex items-center gap-2 ml-2 relative">
+                <button
+                  className="p-1 text-claude-textSecondary hover:text-claude-text transition-colors"
                   title="Add to project"
-                  onClick={() => alert('Projects feature is coming soon!')}
+                  onClick={handleAddToProject}
                 >
-                  <IconProjects size={40} className="dark:invert" />
+                  <IconProjects size={20} className="dark:invert" />
                 </button>
-                <button  
+                {showProjectPicker && (
+                  <>
+                    <div className="fixed inset-0 z-40" onClick={() => setShowProjectPicker(false)} />
+                    <div ref={projectPickerRef} className="absolute top-full left-0 mt-1.5 w-[240px] bg-white dark:bg-[#2A2928] border border-claude-border rounded-xl shadow-lg py-1.5 z-50">
+                      <div className="px-3 py-2 text-[12px] font-medium text-claude-textSecondary border-b border-claude-border">
+                        移动到项目
+                      </div>
+                      {projectList.map(p => (
+                        <button
+                          key={p.id}
+                          onClick={() => handleMoveToProject(p.id)}
+                          className="w-full text-left px-3 py-2.5 text-[14px] text-claude-text hover:bg-black/5 dark:hover:bg-white/5 transition-colors truncate"
+                        >
+                          {p.name}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+                <button
                   onClick={handleDeleteSelected}
-                  className="p-1 text-gray-500 hover:text-[#B9382C] transition-colors" 
+                  className="p-1 text-[#B9382C] hover:opacity-80 transition-opacity"
                   title="Delete selected"
                 >
                   <Trash size={18} />
                 </button>
               </div>
             </div>
-            <button 
+            <button
               onClick={toggleSelectionMode}
               className="text-claude-textSecondary hover:text-claude-text transition-colors"
             >
@@ -294,7 +351,7 @@ const ChatsPage = () => {
             </button>
           </div>
         ) : (
-          <div className="flex items-center gap-2 mb-4 text-[13px] text-gray-500 h-8">
+          <div className="flex items-center gap-2 mb-4 text-[13px] text-claude-textSecondary h-8">
             <span>{chats.length} chats with Claude</span>
             <button onClick={toggleSelectionMode} className="text-blue-600 hover:underline">Select</button>
           </div>
@@ -302,9 +359,9 @@ const ChatsPage = () => {
 
         <div className="space-y-0">
           {loading ? (
-            <div className="py-8 text-center text-gray-500">Loading chats...</div>
+            <div className="py-8 text-center text-claude-textSecondary">Loading chats...</div>
           ) : filteredChats.length === 0 ? (
-            <div className="py-8 text-center text-gray-500">No chats found</div>
+            <div className="py-8 text-center text-claude-textSecondary">No chats found</div>
           ) : (
             filteredChats.map((chat) => {
               const isSelected = selectedChatIds.has(chat.id);
@@ -324,7 +381,7 @@ const ChatsPage = () => {
                   `}
                 >
                   {/* Checkbox (Always visible in selection mode, or on hover) */}
-                  <div 
+                  <div
                     className={`
                       absolute left-4 transition-all duration-200 flex items-center justify-center
                       ${isSelectionMode ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}
@@ -355,7 +412,7 @@ const ChatsPage = () => {
                         {chat.title || 'Untitled'}
                       </h3>
                     </div>
-                    <div className="text-[13px] text-gray-400">
+                    <div className="text-[13px] text-claude-textSecondary">
                       Last message {formatTimeAgo(chat.updated_at || chat.created_at)}
                     </div>
                   </div>
@@ -364,7 +421,7 @@ const ChatsPage = () => {
                   {!isSelectionMode && (
                     <button
                       onClick={(e) => handleMenuClick(e, chat)}
-                      className={`absolute right-4 p-1.5 rounded-md text-gray-400 hover:text-claude-text hover:bg-black/5 dark:hover:bg-white/10 transition-all ${activeMenuId === chat.id ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
+                      className={`absolute right-4 p-1.5 rounded-md text-claude-textSecondary hover:text-claude-text hover:bg-black/5 dark:hover:bg-white/10 transition-all ${activeMenuId === chat.id ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
                     >
                       <MoreHorizontal size={20} />
                     </button>
@@ -378,7 +435,7 @@ const ChatsPage = () => {
 
       {/* Context Menu */}
       {activeMenuId && menuPosition && !isSelectionMode && (
-        <div 
+        <div
           ref={menuRef}
           className="fixed z-50 bg-claude-input border border-claude-border rounded-xl shadow-[0_4px_12px_rgba(0,0,0,0.08)] py-1.5 flex flex-col w-[200px]"
           style={{ top: menuPosition.top, left: menuPosition.left }}
@@ -387,7 +444,7 @@ const ChatsPage = () => {
             <Star size={16} className="text-claude-textSecondary group-hover:text-claude-text" />
             <span className="text-[13px] text-claude-text">Star</span>
           </button>
-          <button 
+          <button
             onClick={() => handleRenameClick(chats.find(c => c.id === activeMenuId))}
             className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group"
           >
