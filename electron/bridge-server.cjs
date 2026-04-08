@@ -260,7 +260,7 @@ function initServer(mainWindow) {
                         const openaiBody = {
                             model: target.model || anthropicReq.model,
                             messages: openaiMessages,
-                            max_tokens: anthropicReq.max_tokens || 4096,
+                            max_tokens: Math.min(anthropicReq.max_tokens || 4096, 8192),
                             stream: true,
                         };
                         if (openaiTools.length > 0) openaiBody.tools = openaiTools;
@@ -1175,7 +1175,7 @@ function initServer(mainWindow) {
 
             const envVars = Object.assign({}, process.env);
             if (apiKey) envVars.ANTHROPIC_API_KEY = apiKey;
-            if (baseUrl) envVars.ANTHROPIC_BASE_URL = baseUrl;
+            envVars.ANTHROPIC_BASE_URL = baseUrl || engineEnvVars.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
 
             console.log('[Compact] Spawning engine /compact, session=' + conv.claude_session_id + ' model=' + modelId);
 
@@ -2238,7 +2238,7 @@ You have the following skills available. When a user's request matches a skill's
             envVars.ANTHROPIC_API_KEY = 'proxy-key'; envVars.ANTHROPIC_BASE_URL = 'http://127.0.0.1:' + proxyPort + '/v1';
             try { const warmUrl = new URL(normalizeBaseUrl(baseUrl)); require('dns').resolve4(warmUrl.hostname, () => {}); fetch(warmUrl.origin, { method: 'HEAD', signal: AbortSignal.timeout(5000) }).catch(() => {}); } catch (_) {}
             console.log('[EnginePool] OpenAI proxy, model=' + modelId);
-        } else { if (apiKey) envVars.ANTHROPIC_API_KEY = apiKey; if (baseUrl) envVars.ANTHROPIC_BASE_URL = normalizeBaseUrl(baseUrl); }
+        } else { if (apiKey) envVars.ANTHROPIC_API_KEY = apiKey; envVars.ANTHROPIC_BASE_URL = normalizeBaseUrl(baseUrl || engineEnvVars.ANTHROPIC_BASE_URL || 'https://api.anthropic.com'); }
         console.log('[EnginePool] Spawning persistent engine, conv=' + convId + ' model=' + modelId + ' session=' + (conv.claude_session_id || 'new'));
         const { spawn } = require('child_process');
         const child = spawn(bunExePath, cliArgs, { cwd: conv.workspace_path, env: envVars, stdio: ['pipe', 'pipe', 'pipe'] });
