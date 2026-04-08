@@ -15,7 +15,7 @@ jobs:
             bun_ext: .exe
           - os: macos-latest
             platform: mac
-            bun_target: bun-darwin-x64
+            bun_target: bun-darwin-arm64
             bun_ext: ""
           - os: ubuntu-latest
             platform: linux
@@ -64,3 +64,54 @@ jobs:
         run: npx electron-builder --linux AppImage deb --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # After all builds complete, sync release files to Chengdu server for auto-update
+  sync-updates:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+      - name: Download release assets and sync to Chengdu
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CHENGDU_HOST: 47.108.25.68
+          CHENGDU_PASS: ${{ secrets.CHENGDU_SSH_PASS }}
+        run: |
+          # Install sshpass
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+          # Download all release assets from GitHub
+          mkdir -p updates
+          cd updates
+          GH_API="https://api.github.com/repos/${{ github.repository }}/releases/tags/${GITHUB_REF_NAME}"
+          ASSETS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$GH_API" | jq -r '.assets[] | .browser_download_url')
+          for url in $ASSETS; do
+            fname=$(basename "$url")
+            echo "Downloading $fname..."
+            curl -sL -o "$fname" "$url"
+            ls -lh "$fname"
+          done
+          cd ..
+
+          # Upload to Chengdu server
+          echo "Uploading to Chengdu server..."
+          sshpass -p "$CHENGDU_PASS" scp -o StrictHostKeyChecking=no updates/* root@${CHENGDU_HOST}:/www/wwwroot/claude-app/updates/
+
+          # Clean old version files (keep only current version + yml files)
+          echo "Cleaning old files..."
+          sshpass -p "$CHENGDU_PASS" ssh -o StrictHostKeyChecking=no root@${CHENGDU_HOST} "
+            cd /www/wwwroot/claude-app/updates/
+            # Remove files that don't match current version and aren't yml
+            for f in *.exe *.exe.blockmap *.zip *.zip.blockmap *.dmg *.dmg.blockmap *.AppImage *.deb; do
+              if [ -f \"\$f\" ] && ! echo \"\$f\" | grep -q '${VERSION}'; then
+                echo \"Removing old: \$f\"
+                rm -f \"\$f\"
+              fi
+            done
+            chown -R www:www /www/wwwroot/claude-app/updates/
+            echo 'Files on server:'
+            ls -lh /www/wwwroot/claude-app/updates/
+          "
+          echo "Done!"
