@@ -69,6 +69,8 @@ jobs:
   sync-updates:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Get version from tag
         id: version
@@ -78,22 +80,20 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           CHENGDU_HOST: 47.108.25.68
           CHENGDU_PASS: ${{ secrets.CHENGDU_SSH_PASS }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          # Install sshpass
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
 
-          # Download all release assets from GitHub
+          # Download all release assets (gh CLI works with draft releases)
           mkdir -p updates
-          cd updates
-          GH_API="https://api.github.com/repos/${{ github.repository }}/releases/tags/${GITHUB_REF_NAME}"
-          ASSETS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$GH_API" | jq -r '.assets[] | .browser_download_url')
-          for url in $ASSETS; do
-            fname=$(basename "$url")
-            echo "Downloading $fname..."
-            curl -sL -o "$fname" "$url"
-            ls -lh "$fname"
-          done
-          cd ..
+          gh release download "${GITHUB_REF_NAME}" -D updates/
+          echo "Downloaded assets:"
+          ls -lh updates/
+
+          # Publish draft release so clients can see it
+          gh release edit "${GITHUB_REF_NAME}" --draft=false
+          echo "Release published."
 
           # Upload to Chengdu server
           echo "Uploading to Chengdu server..."
@@ -103,7 +103,6 @@ jobs:
           echo "Cleaning old files..."
           sshpass -p "$CHENGDU_PASS" ssh -o StrictHostKeyChecking=no root@${CHENGDU_HOST} "
             cd /www/wwwroot/claude-app/updates/
-            # Remove files that don't match current version and aren't yml
             for f in *.exe *.exe.blockmap *.zip *.zip.blockmap *.dmg *.dmg.blockmap *.AppImage *.deb; do
               if [ -f \"\$f\" ] && ! echo \"\$f\" | grep -q '${VERSION}'; then
                 echo \"Removing old: \$f\"
