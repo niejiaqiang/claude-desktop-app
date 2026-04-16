@@ -251,7 +251,7 @@ export async function updateUserProfile(data: Record<string, any>) {
 export async function getUserUsage() {
   let usage: any = null;
 
-  // Get plan info from Chengdu backend
+  // Get plan info from Chengdu backend (requires auth_token from session-based login)
   if (isElectronApp && localStorage.getItem('auth_token')) {
     try {
       usage = await chengduRequest('/user/usage');
@@ -262,17 +262,20 @@ export async function getUserUsage() {
   if (isElectronApp) {
     try {
       const gwUsage = await getGatewayUsage();
-      if (gwUsage && usage && usage.quota) {
-        // Combine: Chengdu tracks website usage, gateway tracks app usage
-        if (usage.quota.window) {
-          const webUsed = usage.quota.window.used || 0;
-          const appUsed = gwUsage.window_used || 0;
-          usage.quota.window.used = webUsed + appUsed;
-        }
-        if (usage.quota.week) {
-          const webUsed = usage.quota.week.used || 0;
-          const appUsed = gwUsage.week_used || 0;
-          usage.quota.week.used = webUsed + appUsed;
+      if (gwUsage) {
+        if (usage && usage.quota) {
+          // Both sources available: combine
+          if (usage.quota.window) {
+            usage.quota.window.used = (usage.quota.window.used || 0) + (gwUsage.window_used || 0);
+          }
+          if (usage.quota.week) {
+            usage.quota.week.used = (usage.quota.week.used || 0) + (gwUsage.week_used || 0);
+          }
+        } else if (!usage) {
+          // No Chengdu auth_token — use gateway usage as primary source.
+          // SG gateway's /gateway/usage calls Chengdu internal /user/:id/summary,
+          // so it has the real plan+quota data even without a session cookie.
+          usage = gwUsage;
         }
       }
     } catch (_) {}
@@ -280,17 +283,13 @@ export async function getUserUsage() {
 
   if (usage) return usage;
 
+  // selfhosted mode (no gateway, no Chengdu) — unlimited placeholder
   return {
-    plan: {
-      id: 999,
-      name: 'Claude Code Unlimited',
-      status: 'active',
-      price: 0
-    },
-    token_quota: 99999999,
-    token_remaining: 99999999,
+    plan: { id: 999, name: 'Self-hosted', status: 'active', price: 0 },
+    token_quota: 0,
+    token_remaining: 0,
     used: 0,
-    reset_date: '2099-12-31',
+    reset_date: '',
     is_unlimited: true
   };
 }
